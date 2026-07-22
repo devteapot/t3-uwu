@@ -1,0 +1,24 @@
+[package]
+name = "t3-uwu"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+description = "Use a Wooting UwU as a layered T3 Code agent controller"
+repository = "https://github.com/devteapot/t3-uwu"
+readme = "README.md"
+keywords = ["wooting", "uwu", "t3-code", "macropad", "hid"]
+categories = ["command-line-utilities", "hardware-support"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
+dirs = "6.0"
+hidapi = "2.6"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9"
+
+[profile.release]
+lto = "thin"
+strip = true

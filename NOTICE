@@ -1,0 +1,9 @@
+t3-uwu contains an independent Rust implementation of the documented Wooting
+analog and RGB HID protocols. Protocol details were derived from Wooting's
+official open-source SDKs, which are licensed under MPL-2.0:
+
+- https://github.com/WootingKb/wooting-analog-sdk
+- https://github.com/WootingKb/wooting-rgb-sdk
+
+T3 Code, Codex, Wooting, and UwU are trademarks of their respective owners.
+This project is not affiliated with or endorsed by OpenAI, T3 Chat, or Wooting.

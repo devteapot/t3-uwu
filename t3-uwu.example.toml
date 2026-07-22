@@ -1,0 +1,33 @@
+t3_database = "/Users/YOU/.t3/userdata/state.sqlite"
+t3_app_name_contains = "T3 Code"
+actuation_threshold = 0.42
+release_threshold = 0.18
+brightness = 0.65
+poll_interval_ms = 400
+
+hall_keys = [
+  { row = 2, col = 1 },
+  { row = 2, col = 3 },
+  { row = 2, col = 5 },
+]
+
+layer_buttons = [
+  { row = 3, col = 2 },
+  { row = 3, col = 3 },
+  { row = 3, col = 4 },
+]
+
+[[layers]]
+name = "Agents"
+color = "#7c6cff"
+actions = ["thread.jump.1", "thread.jump.2", "thread.jump.3"]
+
+[[layers]]
+name = "Chat"
+color = "#24c8db"
+actions = ["chat.new", "commandPalette.toggle", "diff.toggle"]
+
+[[layers]]
+name = "Tools"
+color = "#ff9f43"
+actions = ["terminal.toggle", "preview.toggle", "modelPicker.toggle"]
