@@ -30,6 +30,15 @@ impl Shortcut {
             control: false,
         }
     }
+    const fn cmd_option(key: &'static str) -> Self {
+        Self {
+            key,
+            command: true,
+            shift: false,
+            option: true,
+            control: false,
+        }
+    }
 }
 
 pub fn run(action: &str, app_name_contains: &str) -> Result<()> {
@@ -37,12 +46,21 @@ pub fn run(action: &str, app_name_contains: &str) -> Result<()> {
         "thread.jump.1" => Shortcut::cmd("1"),
         "thread.jump.2" => Shortcut::cmd("2"),
         "thread.jump.3" => Shortcut::cmd("3"),
+        "thread.jump.4" => Shortcut::cmd("4"),
+        "thread.jump.5" => Shortcut::cmd("5"),
+        "thread.jump.6" => Shortcut::cmd("6"),
+        "thread.previous" => Shortcut::cmd_shift("["),
+        "thread.next" => Shortcut::cmd_shift("]"),
         "chat.new" => Shortcut::cmd("n"),
+        "chat.newLocal" => Shortcut::cmd_shift("n"),
         "commandPalette.toggle" => Shortcut::cmd("k"),
         "diff.toggle" => Shortcut::cmd("d"),
         "terminal.toggle" => Shortcut::cmd("j"),
         "preview.toggle" => Shortcut::cmd_shift("j"),
+        "preview.refresh" => Shortcut::cmd("r"),
         "modelPicker.toggle" => Shortcut::cmd_shift("m"),
+        "sidebar.toggle" => Shortcut::cmd("b"),
+        "rightPanel.toggle" => Shortcut::cmd_option("b"),
         "none" => return Ok(()),
         other => bail!("unknown action {other:?}"),
     };

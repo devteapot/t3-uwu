@@ -114,16 +114,32 @@ pub struct Trigger {
     down: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TriggerTransition {
+    Pressed,
+    Released,
+}
+
 impl Trigger {
     pub fn update(&mut self, value: f32, press: f32, release: f32) -> bool {
+        self.transition(value, press, release) == Some(TriggerTransition::Pressed)
+    }
+
+    pub fn transition(
+        &mut self,
+        value: f32,
+        press: f32,
+        release: f32,
+    ) -> Option<TriggerTransition> {
         if !self.down && value >= press {
             self.down = true;
-            return true;
+            return Some(TriggerTransition::Pressed);
         }
         if self.down && value <= release {
             self.down = false;
+            return Some(TriggerTransition::Released);
         }
-        false
+        None
     }
 }
 
@@ -140,5 +156,19 @@ mod tests {
         assert!(!trigger.update(0.2, 0.4, 0.15));
         assert!(!trigger.update(0.1, 0.4, 0.15));
         assert!(trigger.update(0.5, 0.4, 0.15));
+    }
+
+    #[test]
+    fn trigger_reports_release_transitions() {
+        let mut trigger = Trigger::default();
+        assert_eq!(
+            trigger.transition(0.5, 0.4, 0.15),
+            Some(TriggerTransition::Pressed)
+        );
+        assert_eq!(trigger.transition(0.2, 0.4, 0.15), None);
+        assert_eq!(
+            trigger.transition(0.1, 0.4, 0.15),
+            Some(TriggerTransition::Released)
+        );
     }
 }

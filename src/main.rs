@@ -1,5 +1,6 @@
 mod actions;
 mod config;
+mod controls;
 mod hardware;
 mod rgb;
 mod t3;
@@ -21,7 +22,8 @@ use clap::{Parser, Subcommand};
 use hidapi::HidApi;
 
 use config::Config;
-use hardware::{Position, Trigger, UwUInput};
+use controls::{ControllerEvent, KeyRoute, LayerController};
+use hardware::{Position, Trigger, TriggerTransition, UwUInput};
 use rgb::{EDGE_POSITIONS, LED_POSITIONS, Rgb, UwURgb};
 use t3::{AgentPhase, StateSnapshot, T3State, ThreadSlot};
 
@@ -212,7 +214,7 @@ fn run(config: Config) -> Result<()> {
     let api = HidApi::new().context("failed to initialize HID access")?;
     let mut input = UwUInput::open(&api)?;
     let mut rgb = UwURgb::open(&api)?;
-    let mut active_layer = 0_usize;
+    let mut controller = LayerController::new(0);
     let mut hall_triggers = [Trigger::default(); 3];
     let mut button_triggers = [Trigger::default(); 3];
     let mut last_slots = Vec::new();
@@ -228,37 +230,63 @@ fn run(config: Config) -> Result<()> {
     let state_updates = spawn_t3_state_worker(config.clone(), Arc::clone(&running));
 
     eprintln!("t3-uwu connected — layer 1: {}", config.layers[0].name);
-    eprintln!("Top buttons select layers; HE keys run the three actions in that layer.");
+    eprintln!("Tap a button to select its layer; hold it to arm three combo actions.");
+    eprintln!("HE keys run the three actions in the active or held layer.");
     eprintln!("The active Wootility profile should leave all six controls unbound.");
     warn_if_wootility_is_running();
 
     while running.load(Ordering::SeqCst) {
         let samples = input.read(20)?;
+        let now = Instant::now();
         for (index, trigger) in button_triggers.iter_mut().enumerate() {
             let value = sample_value(samples, config.layer_buttons[index]);
-            if trigger.update(value, config.actuation_threshold, config.release_threshold) {
-                active_layer = index;
-                eprintln!("layer {}: {}", index + 1, config.layers[index].name);
-                next_render = Instant::now();
+            match trigger.transition(value, config.actuation_threshold, config.release_threshold) {
+                Some(TriggerTransition::Pressed) => {
+                    if let Some(event) = controller.button_pressed(index, now) {
+                        report_controller_event(event, &config);
+                        next_render = now;
+                    }
+                }
+                Some(TriggerTransition::Released) => {
+                    let was_armed = controller.combo_layer().is_some();
+                    if let Some(event) = controller.button_released(index) {
+                        report_controller_event(event, &config);
+                        next_render = now;
+                    } else if was_armed {
+                        next_render = now;
+                    }
+                }
+                None => {}
             }
+        }
+        if let Some(event) = controller.update(now, Duration::from_millis(config.combo_hold_ms)) {
+            report_controller_event(event, &config);
+            next_render = now;
         }
         for (index, trigger) in hall_triggers.iter_mut().enumerate() {
             let value = sample_value(samples, config.hall_keys[index]);
             if trigger.update(value, config.actuation_threshold, config.release_threshold) {
-                let action = &config.layers[active_layer].actions[index];
-                eprintln!(
-                    "{} / key {} -> {}",
-                    config.layers[active_layer].name,
-                    index + 1,
-                    action
-                );
+                let (name, action) = match controller.key_pressed(index) {
+                    KeyRoute::Base { layer, key } => (
+                        &config.layers[layer].name,
+                        &config.layers[layer].actions[key],
+                    ),
+                    KeyRoute::Combo { layer, key } => {
+                        let layer = &config.layers[layer];
+                        (&layer.hold.name, &layer.hold.actions[key])
+                    }
+                    KeyRoute::Suppressed => {
+                        eprintln!("combo not armed yet; keep holding the layer button");
+                        continue;
+                    }
+                };
+                eprintln!("{} / key {} -> {}", name, index + 1, action);
                 if let Err(error) = actions::run(action, &config.t3_app_name_contains) {
                     eprintln!("action error: {error:#}");
                 }
             }
         }
 
-        let now = Instant::now();
         while let Ok(update) = state_updates.try_recv() {
             match update {
                 StateUpdate::Snapshot(snapshot) => {
@@ -294,7 +322,8 @@ fn run(config: Config) -> Result<()> {
             }
             let frame = render_frame(
                 &config,
-                active_layer,
+                controller.active_layer(),
+                controller.combo_layer(),
                 &last_slots,
                 animation_start.elapsed(),
             );
@@ -308,6 +337,18 @@ fn run(config: Config) -> Result<()> {
     }
     eprintln!("restoring onboard UwU lighting");
     rgb.reset()
+}
+
+fn report_controller_event(event: ControllerEvent, config: &Config) {
+    match event {
+        ControllerEvent::LayerSelected(layer) => {
+            eprintln!("layer {}: {}", layer + 1, config.layers[layer].name);
+        }
+        ControllerEvent::ComboArmed(layer) => {
+            let config = &config.layers[layer];
+            eprintln!("hold layer {} armed: {}", layer + 1, config.hold.name);
+        }
+    }
 }
 
 enum StateUpdate {
@@ -360,11 +401,18 @@ fn sample_value(samples: &HashMap<Position, hardware::KeySample>, position: Posi
 fn render_frame(
     config: &Config,
     active_layer: usize,
+    combo_layer: Option<usize>,
     slots: &[ThreadSlot],
     elapsed: Duration,
 ) -> HashMap<Position, Rgb> {
-    let layer_color =
-        Rgb::from_hex(&config.layers[active_layer].color).unwrap_or(Rgb(120, 100, 255));
+    let visual_layer = combo_layer.unwrap_or(active_layer);
+    let layer = &config.layers[visual_layer];
+    let color = if combo_layer.is_some() {
+        &layer.hold.color
+    } else {
+        &layer.color
+    };
+    let layer_color = Rgb::from_hex(color).unwrap_or(Rgb(120, 100, 255));
     let pulse = 0.28 + 0.14 * ((elapsed.as_secs_f32() * 2.4).sin() + 1.0);
     let mut frame = EDGE_POSITIONS
         .into_iter()
@@ -372,18 +420,23 @@ fn render_frame(
         .collect::<HashMap<_, _>>();
 
     for (index, position) in config.layer_buttons.iter().copied().enumerate() {
-        let color = if index == active_layer {
-            Rgb(255, 255, 255)
-        } else {
-            Rgb::from_hex(&config.layers[index].color)
-                .unwrap_or_default()
-                .scale(0.15)
-        };
+        let color =
+            if combo_layer == Some(index) || (combo_layer.is_none() && index == active_layer) {
+                Rgb(255, 255, 255)
+            } else if combo_layer.is_some() && index == active_layer {
+                Rgb::from_hex(&config.layers[index].color)
+                    .unwrap_or_default()
+                    .scale(0.45)
+            } else {
+                Rgb::from_hex(&config.layers[index].color)
+                    .unwrap_or_default()
+                    .scale(0.15)
+            };
         frame.insert(position, color.scale(config.brightness));
     }
 
     for (index, position) in config.hall_keys.iter().copied().enumerate() {
-        let color = if active_layer == 0 {
+        let color = if combo_layer.is_none() && active_layer == 0 {
             slots
                 .get(index)
                 .map_or(Rgb(25, 25, 30), |slot| phase_color(slot.phase))

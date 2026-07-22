@@ -1,6 +1,6 @@
 [package]
 name = "t3-uwu"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MPL-2.0"
 description = "Use a Wooting UwU as a layered T3 Code agent controller"

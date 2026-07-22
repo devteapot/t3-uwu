@@ -10,14 +10,29 @@ commands.
 
 ## Default layout
 
-The three small buttons select a layer. The selected layer button is white; the
-other two show their layer colors dimly.
+Tap one of the three small buttons to select its persistent layer. Hold a
+button for 350 ms to arm its temporary hold layer, then press any of the three
+HE keys. Releasing the button returns to the previously selected layer. A long
+hold with no HE action behaves like a tap and selects that layer.
+
+The selected layer button is white. When a hold layer arms, the button and HE
+keys change color so the mode switch is visible before an action fires.
+
+Persistent layers:
 
 | Button / layer | Left HE key | Middle HE key | Right HE key |
 |---|---|---|---|
 | 1 — Agents | Thread 1 | Thread 2 | Thread 3 |
 | 2 — Chat | New chat | Command palette | Diff panel |
 | 3 — Tools | Terminal | Preview | Model picker |
+
+Hold layers:
+
+| Hold button | Left HE key | Middle HE key | Right HE key |
+|---|---|---|---|
+| 1 — More agents | Thread 4 | Thread 5 | Thread 6 |
+| 2 — Navigate | Previous thread | Next thread | New local chat |
+| 3 — Workspace | Sidebar | Right panel | Refresh preview |
 
 On the Agents layer, the main key LEDs reflect the first three threads in T3's
 current sidebar-v2 ordering: active threads in newest-created order, followed
@@ -31,9 +46,9 @@ shortcuts when the sidebar is unscoped:
 - red: failed
 - dim: no thread/unknown
 
-The mapping gives nine actions immediately. The HE input path also preserves
-analog travel, so dual-stage or press-depth gestures can be added without a
-hardware change.
+The mapping exposes 18 actions while keeping the three top buttons useful as
+ordinary layer selectors. The HE input path also preserves analog travel, so
+dual-stage or press-depth gestures can be added without a hardware change.
 
 ## Build and run
 
@@ -110,9 +125,17 @@ If your firmware exposes different positions, copy `t3-uwu.example.toml` to
 
 ## Configuration and current limits
 
-The action names supported in the example config are the T3 commands implemented
-by this prototype. They use T3's default macOS shortcuts, so customized T3
-keybindings may need matching changes in `src/actions.rs` for now.
+Each of the exactly three `[[layers]]` entries requires a base `name`, `color`,
+and three `actions`, plus a `[layers.hold]` table with its own `name`, `color`,
+and three `actions`. `combo_hold_ms` controls the hold threshold and accepts
+values from 100 through 5000 ms. This configuration shape is new in v0.3 and
+older custom files must add the required hold tables; see
+`t3-uwu.example.toml` for a complete example.
+
+The action names supported in the example config are the T3 commands
+implemented by this prototype. They use T3's default macOS shortcuts, so
+customized T3 keybindings may need matching changes in `src/actions.rs` for
+now.
 
 The default `t3_state_source = "auto"` uses the authenticated shell-snapshot API
 after pairing and otherwise opens `t3_database` read-only. Set it to `"api"` to

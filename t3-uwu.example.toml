@@ -12,6 +12,8 @@ actuation_threshold = 0.42
 release_threshold = 0.18
 brightness = 0.65
 poll_interval_ms = 750
+# How long a layer button must be held before its temporary hold layer arms.
+combo_hold_ms = 350
 
 hall_keys = [
   { row = 2, col = 1 },
@@ -30,12 +32,27 @@ name = "Agents"
 color = "#7c6cff"
 actions = ["thread.jump.1", "thread.jump.2", "thread.jump.3"]
 
+[layers.hold]
+name = "More agents"
+color = "#d06cff"
+actions = ["thread.jump.4", "thread.jump.5", "thread.jump.6"]
+
 [[layers]]
 name = "Chat"
 color = "#24c8db"
 actions = ["chat.new", "commandPalette.toggle", "diff.toggle"]
 
+[layers.hold]
+name = "Navigate"
+color = "#24db8f"
+actions = ["thread.previous", "thread.next", "chat.newLocal"]
+
 [[layers]]
 name = "Tools"
 color = "#ff9f43"
 actions = ["terminal.toggle", "preview.toggle", "modelPicker.toggle"]
+
+[layers.hold]
+name = "Workspace"
+color = "#ff5f57"
+actions = ["sidebar.toggle", "rightPanel.toggle", "preview.refresh"]
