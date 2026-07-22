@@ -12,6 +12,8 @@ const COLOR_INIT_COMMAND: u8 = 33;
 const RESET_ALL_COMMAND: u8 = 32;
 const RAW_COLORS_REPORT: u8 = 11;
 const V3_REPORT_SIZE: usize = 2047;
+const V3_RESPONSE_SIZE: usize = 2046;
+const FEATURE_RESPONSE_TIMEOUT_MS: i32 = 1000;
 
 pub const LED_POSITIONS: [Position; 20] = [
     Position::new(0, 0),
@@ -82,6 +84,7 @@ impl Rgb {
 pub struct UwURgb {
     device: HidDevice,
     last_frame: HashMap<Position, Rgb>,
+    restored: bool,
 }
 
 impl UwURgb {
@@ -97,6 +100,7 @@ impl UwURgb {
         let this = Self {
             device,
             last_frame: HashMap::new(),
+            restored: false,
         };
         this.send_feature(COLOR_INIT_COMMAND)?;
         Ok(this)
@@ -107,8 +111,20 @@ impl UwURgb {
         self.device
             .send_feature_report(&report)
             .with_context(|| format!("failed to send Wooting feature command {command}"))?;
-        let mut response = vec![0_u8; 2046];
-        let _ = self.device.read_timeout(&mut response, 100);
+        let mut response = vec![0_u8; V3_RESPONSE_SIZE];
+        let received = self
+            .device
+            .read_timeout(&mut response, FEATURE_RESPONSE_TIMEOUT_MS)
+            .with_context(|| format!("failed reading response to Wooting command {command}"))?;
+        anyhow::ensure!(
+            received >= 4,
+            "short Wooting response for command {command}: {received} bytes"
+        );
+        anyhow::ensure!(
+            response[..4] == [1, 0xd1, 0xda, command],
+            "unexpected Wooting response for command {command}: {:02x?}",
+            &response[..received.min(8)]
+        );
         Ok(())
     }
 
@@ -142,16 +158,22 @@ impl UwURgb {
         Ok(())
     }
 
-    pub fn reset(&self) -> Result<()> {
+    pub fn reset(&mut self) -> Result<()> {
+        if self.restored {
+            return Ok(());
+        }
         self.send_feature(RESET_ALL_COMMAND)?;
         thread::sleep(Duration::from_millis(30));
+        self.restored = true;
         Ok(())
     }
 }
 
 impl Drop for UwURgb {
     fn drop(&mut self) {
-        let _ = self.reset();
+        if !self.restored {
+            let _ = self.reset();
+        }
     }
 }
 

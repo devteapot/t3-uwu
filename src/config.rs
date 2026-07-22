@@ -8,10 +8,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::hardware::Position;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum T3StateSource {
+    /// Prefer T3's authenticated API when paired, otherwise use local SQLite.
+    #[default]
+    Auto,
+    Api,
+    Sqlite,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    pub t3_state_source: T3StateSource,
+    pub t3_runtime: PathBuf,
     pub t3_database: PathBuf,
+    pub t3_http_url: Option<String>,
+    pub t3_bearer_token_env: String,
     pub t3_app_name_contains: String,
     pub actuation_threshold: f32,
     pub release_threshold: f32,
@@ -33,12 +47,16 @@ impl Default for Config {
     fn default() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         Self {
+            t3_state_source: T3StateSource::Auto,
+            t3_runtime: home.join(".t3/userdata/server-runtime.json"),
             t3_database: home.join(".t3/userdata/state.sqlite"),
+            t3_http_url: None,
+            t3_bearer_token_env: "T3_UWU_BEARER_TOKEN".into(),
             t3_app_name_contains: "T3 Code".into(),
             actuation_threshold: 0.42,
             release_threshold: 0.18,
             brightness: 0.65,
-            poll_interval_ms: 400,
+            poll_interval_ms: 750,
             hall_keys: [
                 Position::new(2, 1),
                 Position::new(2, 3),
@@ -105,6 +123,16 @@ impl Config {
             self.release_threshold < self.actuation_threshold,
             "release_threshold must be below actuation_threshold"
         );
+        anyhow::ensure!(
+            self.poll_interval_ms >= 100,
+            "poll_interval_ms must be at least 100"
+        );
+        if let Some(url) = &self.t3_http_url {
+            anyhow::ensure!(
+                url.starts_with("http://") || url.starts_with("https://"),
+                "t3_http_url must start with http:// or https://"
+            );
+        }
         for layer in self.layers.iter().take(3) {
             crate::rgb::Rgb::from_hex(&layer.color)
                 .with_context(|| format!("invalid color for layer {}", layer.name))?;

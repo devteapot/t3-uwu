@@ -10,6 +10,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
     },
     thread,
     time::{Duration, Instant},
@@ -22,7 +23,7 @@ use hidapi::HidApi;
 use config::Config;
 use hardware::{Position, Trigger, UwUInput};
 use rgb::{EDGE_POSITIONS, LED_POSITIONS, Rgb, UwURgb};
-use t3::{AgentPhase, T3State, ThreadSlot};
+use t3::{AgentPhase, StateSnapshot, T3State, ThreadSlot};
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -46,8 +47,17 @@ enum Command {
     },
     /// Light each physical zone briefly, then restore onboard RGB.
     TestRgb,
+    /// Release Wooting RGB SDK control and restore the onboard lighting effect.
+    ResetRgb,
     /// Print the three T3 thread slots and their resolved state.
     T3State,
+    /// Exchange a T3 pairing link for read-only API access and save it in Keychain.
+    Pair {
+        /// Pairing URL from T3. Omit it to enter the URL without shell-history exposure.
+        pairing_url: Option<String>,
+    },
+    /// Remove t3-uwu's saved T3 API credential from Keychain.
+    Unpair,
     /// Send one supported action to T3 Code (useful for permission testing).
     Action {
         /// For example: thread.jump.1, chat.new, or terminal.toggle.
@@ -62,7 +72,10 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Command::Diagnose { watch, raw }) => diagnose(&config, watch, raw),
         Some(Command::TestRgb) => test_rgb(&config),
+        Some(Command::ResetRgb) => reset_rgb(),
         Some(Command::T3State) => print_t3_state(&config),
+        Some(Command::Pair { pairing_url }) => pair_t3(pairing_url.as_deref()),
+        Some(Command::Unpair) => unpair_t3(),
         Some(Command::Action { action }) => actions::run(&action, &config.t3_app_name_contains),
         None => run(config),
     }
@@ -136,6 +149,7 @@ fn diagnose(config: &Config, watch: bool, raw: bool) -> Result<()> {
 }
 
 fn test_rgb(config: &Config) -> Result<()> {
+    warn_if_wootility_is_running();
     let api = HidApi::new()?;
     let mut rgb = UwURgb::open(&api)?;
     for color in [Rgb(255, 40, 40), Rgb(40, 255, 100), Rgb(50, 100, 255)] {
@@ -149,10 +163,47 @@ fn test_rgb(config: &Config) -> Result<()> {
     rgb.reset()
 }
 
+fn reset_rgb() -> Result<()> {
+    let api = HidApi::new()?;
+    let mut rgb = UwURgb::open(&api)?;
+    rgb.reset()?;
+    println!("Released RGB SDK control and restored onboard UwU lighting.");
+    Ok(())
+}
+
 fn print_t3_state(config: &Config) -> Result<()> {
-    let state = T3State::open(&config.t3_database)?;
-    for (index, slot) in state.slots()?.iter().enumerate() {
+    let state = T3State::open(config)?;
+    let snapshot = state.slots()?;
+    println!("State source: {}", snapshot.source.label());
+    if let Some(reason) = snapshot.degraded_reason {
+        println!("API fallback reason: {reason}");
+    }
+    for (index, slot) in snapshot.slots.iter().enumerate() {
         println!("{}. {:?} — {}", index + 1, slot.phase, slot.title);
+    }
+    Ok(())
+}
+
+fn pair_t3(pairing_url: Option<&str>) -> Result<()> {
+    let entered;
+    let pairing_url = match pairing_url {
+        Some(url) => url,
+        None => {
+            entered = rpassword::prompt_password("Paste the T3 pairing URL: ")
+                .context("failed to read pairing URL")?;
+            entered.trim()
+        }
+    };
+    let origin = t3::pair(pairing_url)?;
+    println!("Paired with {origin}; the read-only credential is stored in Keychain.");
+    Ok(())
+}
+
+fn unpair_t3() -> Result<()> {
+    if t3::unpair()? {
+        println!("Removed the saved T3 API credential from Keychain.");
+    } else {
+        println!("No saved T3 API credential was found.");
     }
     Ok(())
 }
@@ -161,22 +212,25 @@ fn run(config: Config) -> Result<()> {
     let api = HidApi::new().context("failed to initialize HID access")?;
     let mut input = UwUInput::open(&api)?;
     let mut rgb = UwURgb::open(&api)?;
-    let t3 = T3State::open(&config.t3_database)?;
     let mut active_layer = 0_usize;
     let mut hall_triggers = [Trigger::default(); 3];
     let mut button_triggers = [Trigger::default(); 3];
     let mut last_slots = Vec::new();
-    let mut next_state_poll = Instant::now();
+    let mut last_state_source = None;
+    let mut last_degraded_reason: Option<String> = None;
+    let mut last_state_error_at: Option<Instant> = None;
     let mut next_render = Instant::now();
     let animation_start = Instant::now();
     let running = Arc::new(AtomicBool::new(true));
     let running_for_signal = Arc::clone(&running);
     ctrlc::set_handler(move || running_for_signal.store(false, Ordering::SeqCst))
         .context("failed to install Ctrl-C handler")?;
+    let state_updates = spawn_t3_state_worker(config.clone(), Arc::clone(&running));
 
     eprintln!("t3-uwu connected — layer 1: {}", config.layers[0].name);
     eprintln!("Top buttons select layers; HE keys run the three actions in that layer.");
     eprintln!("The active Wootility profile should leave all six controls unbound.");
+    warn_if_wootility_is_running();
 
     while running.load(Ordering::SeqCst) {
         let samples = input.read(20)?;
@@ -205,12 +259,34 @@ fn run(config: Config) -> Result<()> {
         }
 
         let now = Instant::now();
-        if now >= next_state_poll {
-            match t3.slots() {
-                Ok(slots) => last_slots = slots,
-                Err(error) => eprintln!("T3 state error: {error:#}"),
+        while let Ok(update) = state_updates.try_recv() {
+            match update {
+                StateUpdate::Snapshot(snapshot) => {
+                    if last_state_source != Some(snapshot.source) {
+                        eprintln!("T3 state source: {}", snapshot.source.label());
+                        last_state_source = Some(snapshot.source);
+                    }
+                    if snapshot.degraded_reason != last_degraded_reason {
+                        if let Some(reason) = &snapshot.degraded_reason {
+                            eprintln!("T3 API unavailable; using SQLite: {reason}");
+                        } else if last_degraded_reason.is_some() {
+                            eprintln!("T3 API connection restored");
+                        }
+                        last_degraded_reason = snapshot.degraded_reason;
+                    }
+                    last_slots = snapshot.slots;
+                    last_state_error_at = None;
+                }
+                StateUpdate::Error(error) => {
+                    let should_report = last_state_error_at.is_none_or(|reported| {
+                        now.duration_since(reported) >= Duration::from_secs(10)
+                    });
+                    if should_report {
+                        eprintln!("T3 state error: {error}");
+                        last_state_error_at = Some(now);
+                    }
+                }
             }
-            next_state_poll = now + Duration::from_millis(config.poll_interval_ms);
         }
         if now >= next_render {
             if !running.load(Ordering::SeqCst) {
@@ -222,7 +298,9 @@ fn run(config: Config) -> Result<()> {
                 &last_slots,
                 animation_start.elapsed(),
             );
-            if let Err(error) = rgb.set_frame(&frame) {
+            if let Err(error) = rgb.set_frame(&frame)
+                && running.load(Ordering::SeqCst)
+            {
                 eprintln!("RGB error: {error:#}");
             }
             next_render = now + Duration::from_millis(100);
@@ -230,6 +308,49 @@ fn run(config: Config) -> Result<()> {
     }
     eprintln!("restoring onboard UwU lighting");
     rgb.reset()
+}
+
+enum StateUpdate {
+    Snapshot(StateSnapshot),
+    Error(String),
+}
+
+fn spawn_t3_state_worker(config: Config, running: Arc<AtomicBool>) -> Receiver<StateUpdate> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let state = match T3State::open(&config) {
+            Ok(state) => state,
+            Err(error) => {
+                let _ = sender.send(StateUpdate::Error(format!("{error:#}")));
+                return;
+            }
+        };
+        while running.load(Ordering::SeqCst) {
+            let update = match state.slots() {
+                Ok(snapshot) => StateUpdate::Snapshot(snapshot),
+                Err(error) => StateUpdate::Error(format!("{error:#}")),
+            };
+            if sender.send(update).is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(config.poll_interval_ms));
+        }
+    });
+    receiver
+}
+
+fn warn_if_wootility_is_running() {
+    let running = std::process::Command::new("pgrep")
+        .args(["-x", "Wootility"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if running {
+        eprintln!(
+            "warning: Wootility is running and may override t3-uwu lighting; save the device profile, then quit Wootility"
+        );
+    }
 }
 
 fn sample_value(samples: &HashMap<Position, hardware::KeySample>, position: Position) -> f32 {

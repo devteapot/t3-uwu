@@ -1,9 +1,17 @@
+# "auto" prefers T3's API after pairing and falls back to SQLite.
+# Use "api" to require the API or "sqlite" to force the legacy observer.
+t3_state_source = "auto"
+t3_runtime = "/Users/YOU/.t3/userdata/server-runtime.json"
 t3_database = "/Users/YOU/.t3/userdata/state.sqlite"
+# Set this for a remote T3 server. When omitted, t3-uwu discovers the local URL
+# through t3_runtime.
+# t3_http_url = "https://t3.example.com"
+t3_bearer_token_env = "T3_UWU_BEARER_TOKEN"
 t3_app_name_contains = "T3 Code"
 actuation_threshold = 0.42
 release_threshold = 0.18
 brightness = 0.65
-poll_interval_ms = 400
+poll_interval_ms = 750
 
 hall_keys = [
   { row = 2, col = 1 },

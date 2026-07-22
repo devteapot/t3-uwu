@@ -1,6 +1,6 @@
 [package]
 name = "t3-uwu"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MPL-2.0"
 description = "Use a Wooting UwU as a layered T3 Code agent controller"
@@ -12,11 +12,15 @@ categories = ["command-line-utilities", "hardware-support"]
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-ctrlc = "3.4"
+ctrlc = { version = "3.4", features = ["termination"] }
 dirs = "6.0"
 hidapi = "2.6"
+keyring = "4.1"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "gzip", "json", "rustls"] }
+rpassword = "7.5"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 toml = "0.9"
 
 [profile.release]
