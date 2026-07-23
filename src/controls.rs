@@ -18,7 +18,6 @@ struct HoldGesture {
     layer: usize,
     pressed_at: Instant,
     armed: bool,
-    combo_used: bool,
 }
 
 pub struct LayerController {
@@ -52,7 +51,6 @@ impl LayerController {
             layer,
             pressed_at: now,
             armed: false,
-            combo_used: false,
         });
         None
     }
@@ -72,7 +70,7 @@ impl LayerController {
             return None;
         }
         self.hold = None;
-        if gesture.combo_used {
+        if gesture.armed {
             return None;
         }
         self.active_layer = layer;
@@ -89,7 +87,6 @@ impl LayerController {
         if !gesture.armed {
             return KeyRoute::Suppressed;
         }
-        gesture.combo_used = true;
         KeyRoute::Combo {
             layer: gesture.layer,
             key,
@@ -134,14 +131,15 @@ mod tests {
     }
 
     #[test]
-    fn a_long_hold_without_a_key_still_selects_the_layer() {
+    fn an_armed_hold_without_a_key_preserves_the_persistent_layer() {
         let now = Instant::now();
-        let mut controller = LayerController::new(0);
-        controller.button_pressed(2, now);
-        controller.update(now + HOLD, HOLD);
+        let mut controller = LayerController::new(1);
+        controller.button_pressed(0, now);
         assert_eq!(
-            controller.button_released(2),
-            Some(ControllerEvent::LayerSelected(2))
+            controller.update(now + HOLD, HOLD),
+            Some(ControllerEvent::ComboArmed(0))
         );
+        assert_eq!(controller.button_released(0), None);
+        assert_eq!(controller.active_layer(), 1);
     }
 }

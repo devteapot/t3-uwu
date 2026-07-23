@@ -12,8 +12,9 @@ commands.
 
 Tap one of the three small buttons to select its persistent layer. Hold a
 button for 350 ms to arm its temporary hold layer, then press any of the three
-HE keys. Releasing the button returns to the previously selected layer. A long
-hold with no HE action behaves like a tap and selects that layer.
+HE keys. Releasing the button returns to the previously selected layer, whether
+or not an HE action was triggered. Only a release before the hold layer arms
+selects that layer persistently.
 
 The selected layer button is white. When a hold layer arms, the button and HE
 keys change color so the mode switch is visible before an action fires.
