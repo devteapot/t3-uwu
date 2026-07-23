@@ -25,7 +25,7 @@ use clap::{Parser, Subcommand};
 use hidapi::HidApi;
 
 use codex::CodexState;
-use config::Config;
+use config::{Config, DepthActionConfig};
 use controls::{ControllerEvent, KeyGestureController, KeyGestureEvent, KeyRoute, LayerController};
 use hardware::{Position, Trigger, TriggerTransition, UwUInput};
 use rgb::{EDGE_POSITIONS, LED_POSITIONS, Rgb, UwURgb};
@@ -270,6 +270,8 @@ struct ResolvedKeyBinding {
     tap_action: String,
     hold_action: Option<String>,
     double_tap_action: Option<String>,
+    depth_actions: Vec<DepthActionConfig>,
+    depth_fallback_action: Option<String>,
     actuation_threshold: f32,
     release_threshold: f32,
     is_combo: bool,
@@ -416,6 +418,8 @@ fn run(config: Config) -> Result<()> {
                         now,
                         binding.hold_action.is_some(),
                         binding.double_tap_action.is_some(),
+                        !binding.depth_actions.is_empty(),
+                        value,
                         Duration::from_millis(config.double_tap_ms),
                     ) {
                         let binding = binding.clone();
@@ -463,6 +467,8 @@ fn run(config: Config) -> Result<()> {
                 now,
                 Duration::from_millis(config.key_hold_ms),
                 Duration::from_millis(config.double_tap_ms),
+                sample_value(samples, config.hall_keys[index]),
+                config.depth_reversal_hysteresis,
             ) && let Some(binding) = key_bindings[index].clone()
                 && dispatch_key_gesture(
                     event,
@@ -649,12 +655,8 @@ fn current_key_thresholds(
         &target_config.layers[controller.active_layer()].key_gestures[key]
     };
     (
-        gesture
-            .actuation_threshold
-            .unwrap_or(config.actuation_threshold),
-        gesture
-            .release_threshold
-            .unwrap_or(config.release_threshold),
+        gesture.effective_actuation_threshold(config.actuation_threshold),
+        gesture.effective_release_threshold(config.release_threshold),
     )
 }
 
@@ -693,12 +695,11 @@ fn resolve_key_binding(
         hold_action: configured_action(gesture.hold_action.as_deref()).map(str::to_owned),
         double_tap_action: configured_action(gesture.double_tap_action.as_deref())
             .map(str::to_owned),
-        actuation_threshold: gesture
-            .actuation_threshold
-            .unwrap_or(config.actuation_threshold),
-        release_threshold: gesture
-            .release_threshold
-            .unwrap_or(config.release_threshold),
+        depth_actions: gesture.depth_actions.clone(),
+        depth_fallback_action: configured_action(gesture.depth_fallback_action.as_deref())
+            .map(str::to_owned),
+        actuation_threshold: gesture.effective_actuation_threshold(config.actuation_threshold),
+        release_threshold: gesture.effective_release_threshold(config.release_threshold),
         is_combo,
     })
 }
@@ -716,9 +717,17 @@ fn dispatch_key_gesture(
     runtimes: &HashMap<TargetId, TargetRuntime>,
 ) -> Result<bool> {
     let (gesture_name, action) = match event {
-        KeyGestureEvent::Tap => ("tap", Some(binding.tap_action.as_str())),
-        KeyGestureEvent::Hold => ("hold", binding.hold_action.as_deref()),
-        KeyGestureEvent::DoubleTap => ("double-tap", binding.double_tap_action.as_deref()),
+        KeyGestureEvent::Tap => ("tap".into(), Some(binding.tap_action.as_str())),
+        KeyGestureEvent::Hold => ("hold".into(), binding.hold_action.as_deref()),
+        KeyGestureEvent::DoubleTap => ("double-tap".into(), binding.double_tap_action.as_deref()),
+        KeyGestureEvent::Depth { peak } => (
+            format!("depth {:.0}%", peak * 100.0),
+            depth_action_for(
+                peak,
+                &binding.depth_actions,
+                binding.depth_fallback_action.as_deref(),
+            ),
+        ),
     };
     let Some(action) = action else {
         return Ok(false);
@@ -760,6 +769,19 @@ fn configured_action(action: Option<&str>) -> Option<&str> {
     action
         .map(str::trim)
         .filter(|action| !action.is_empty() && *action != "none")
+}
+
+fn depth_action_for<'a>(
+    peak: f32,
+    actions: &'a [DepthActionConfig],
+    fallback: Option<&'a str>,
+) -> Option<&'a str> {
+    actions
+        .iter()
+        .rev()
+        .find(|depth_action| peak >= depth_action.at)
+        .map(|depth_action| depth_action.action.as_str())
+        .or(fallback)
 }
 
 enum StateUpdate {
@@ -979,4 +1001,38 @@ fn render_frame(
         frame.insert(position, color.scale(config.brightness));
     }
     frame
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn depth(at: f32, action: &str) -> DepthActionConfig {
+        DepthActionConfig {
+            at,
+            action: action.into(),
+        }
+    }
+
+    #[test]
+    fn peak_depth_selects_only_the_deepest_matching_action() {
+        let actions = [
+            depth(0.33, "light"),
+            depth(0.66, "medium"),
+            depth(0.95, "deep"),
+        ];
+        assert_eq!(depth_action_for(0.32, &actions, None), None);
+        assert_eq!(depth_action_for(0.52, &actions, None), Some("light"));
+        assert_eq!(depth_action_for(0.81, &actions, None), Some("medium"));
+        assert_eq!(depth_action_for(0.98, &actions, None), Some("deep"));
+    }
+
+    #[test]
+    fn peak_depth_uses_fallback_below_the_first_point() {
+        let actions = [depth(0.5, "deep")];
+        assert_eq!(
+            depth_action_for(0.4, &actions, Some("fallback")),
+            Some("fallback")
+        );
+    }
 }

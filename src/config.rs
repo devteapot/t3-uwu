@@ -47,6 +47,7 @@ pub struct Config {
     pub combo_hold_ms: u64,
     pub key_hold_ms: u64,
     pub double_tap_ms: u64,
+    pub depth_reversal_hysteresis: f32,
     pub hall_keys: [Position; 3],
     pub layer_buttons: [Position; 3],
 
@@ -130,10 +131,36 @@ pub struct KeyGestureConfig {
     pub hold_action: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub double_tap_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depth_actions: Vec<DepthActionConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_fallback_action: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actuation_threshold: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_threshold: Option<f32>,
+}
+
+impl KeyGestureConfig {
+    pub fn depth_enabled(&self) -> bool {
+        !self.depth_actions.is_empty()
+    }
+
+    pub fn effective_actuation_threshold(&self, default: f32) -> f32 {
+        self.actuation_threshold
+            .or_else(|| self.depth_actions.first().map(|action| action.at))
+            .unwrap_or(default)
+    }
+
+    pub fn effective_release_threshold(&self, default: f32) -> f32 {
+        self.release_threshold.unwrap_or(default)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct DepthActionConfig {
+    pub at: f32,
+    pub action: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -180,6 +207,7 @@ impl Default for Config {
             combo_hold_ms: 350,
             key_hold_ms: 350,
             double_tap_ms: 250,
+            depth_reversal_hysteresis: 0.04,
             hall_keys: [
                 Position::new(2, 1),
                 Position::new(2, 3),
@@ -257,6 +285,10 @@ impl Config {
             "double_tap_ms must be between 100 and 1000"
         );
         anyhow::ensure!(
+            (0.01..=0.25).contains(&self.depth_reversal_hysteresis),
+            "depth_reversal_hysteresis must be between 0.01 and 0.25"
+        );
+        anyhow::ensure!(
             !self.codex_bin.trim().is_empty(),
             "codex_bin cannot be empty"
         );
@@ -290,24 +322,57 @@ impl Config {
                 format!("invalid hold color for target {id} layer {}", layer.name)
             })?;
             for (index, key) in layer.key_gestures.iter().enumerate() {
-                self.validate_key_thresholds(id, &layer.name, index, key)?;
+                self.validate_key_config(id, &layer.name, index, key)?;
             }
             for (index, key) in layer.hold.key_gestures.iter().enumerate() {
-                self.validate_key_thresholds(id, &layer.hold.name, index, key)?;
+                self.validate_key_config(id, &layer.hold.name, index, key)?;
             }
         }
         Ok(())
     }
 
-    fn validate_key_thresholds(
+    fn validate_key_config(
         &self,
         id: TargetId,
         map_name: &str,
         index: usize,
         key: &KeyGestureConfig,
     ) -> Result<()> {
-        let actuation = key.actuation_threshold.unwrap_or(self.actuation_threshold);
-        let release = key.release_threshold.unwrap_or(self.release_threshold);
+        let mut previous_depth = None;
+        for depth_action in &key.depth_actions {
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&depth_action.at),
+                "invalid depth action point for target {id} map {map_name} key {}",
+                index + 1
+            );
+            anyhow::ensure!(
+                previous_depth.is_none_or(|previous| depth_action.at > previous),
+                "depth action points must be strictly increasing for target {id} map {map_name} key {}",
+                index + 1
+            );
+            anyhow::ensure!(
+                !depth_action.action.trim().is_empty() && depth_action.action.trim() != "none",
+                "depth actions cannot be empty or none for target {id} map {map_name} key {}",
+                index + 1
+            );
+            previous_depth = Some(depth_action.at);
+        }
+        if key.depth_enabled() {
+            anyhow::ensure!(
+                !action_is_set(key.hold_action.as_deref())
+                    && !action_is_set(key.double_tap_action.as_deref()),
+                "depth actions cannot be combined with hold or double-tap actions for target {id} map {map_name} key {}",
+                index + 1
+            );
+        } else {
+            anyhow::ensure!(
+                !action_is_set(key.depth_fallback_action.as_deref()),
+                "depth_fallback_action requires depth_actions for target {id} map {map_name} key {}",
+                index + 1
+            );
+        }
+        let actuation = key.effective_actuation_threshold(self.actuation_threshold);
+        let release = key.effective_release_threshold(self.release_threshold);
         anyhow::ensure!(
             (0.0..=1.0).contains(&actuation),
             "invalid actuation threshold for target {id} map {map_name} key {}",
@@ -440,6 +505,13 @@ fn key_gestures_are_unset(gestures: &[KeyGestureConfig; 3]) -> bool {
         .all(|gesture| gesture == &KeyGestureConfig::default())
 }
 
+fn action_is_set(action: Option<&str>) -> bool {
+    action.is_some_and(|action| {
+        let action = action.trim();
+        !action.is_empty() && action != "none"
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +582,8 @@ mod tests {
         config.targets.codex.layers[0].key_gestures[0] = KeyGestureConfig {
             hold_action: Some("chat.new".into()),
             double_tap_action: Some("thread.jump.4".into()),
+            depth_actions: Vec::new(),
+            depth_fallback_action: None,
             actuation_threshold: Some(0.7),
             release_threshold: Some(0.2),
         };
@@ -528,6 +602,79 @@ mod tests {
         config.targets.t3.layers[0].key_gestures[0].actuation_threshold = Some(0.5);
         config.targets.t3.layers[0].key_gestures[0].release_threshold = Some(0.6);
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn depth_actions_round_trip_and_use_the_first_point_for_actuation() {
+        let mut config = Config::default();
+        let gesture = &mut config.targets.codex.layers[0].key_gestures[0];
+        gesture.depth_actions = vec![
+            DepthActionConfig {
+                at: 0.33,
+                action: "thread.jump.1".into(),
+            },
+            DepthActionConfig {
+                at: 0.66,
+                action: "thread.jump.2".into(),
+            },
+            DepthActionConfig {
+                at: 0.95,
+                action: "thread.jump.3".into(),
+            },
+        ];
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: Config = toml::from_str(&encoded).unwrap();
+        decoded.validate().unwrap();
+        let gesture = &decoded.targets.codex.layers[0].key_gestures[0];
+        assert_eq!(gesture.depth_actions.len(), 3);
+        assert_eq!(
+            gesture.effective_actuation_threshold(config.actuation_threshold),
+            0.33
+        );
+    }
+
+    #[test]
+    fn depth_actions_cannot_mix_with_timing_gestures_or_be_unsorted() {
+        let mut config = Config::default();
+        let gesture = &mut config.targets.t3.layers[0].key_gestures[0];
+        gesture.depth_actions = vec![
+            DepthActionConfig {
+                at: 0.66,
+                action: "thread.jump.2".into(),
+            },
+            DepthActionConfig {
+                at: 0.33,
+                action: "thread.jump.1".into(),
+            },
+        ];
+        assert!(config.validate().is_err());
+
+        let gesture = &mut config.targets.t3.layers[0].key_gestures[0];
+        gesture.depth_actions.swap(0, 1);
+        gesture.hold_action = Some("chat.new".into());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn documented_inline_depth_mapping_parses() {
+        #[derive(Deserialize)]
+        struct Example {
+            #[serde(default = "default_key_gestures")]
+            key_gestures: [KeyGestureConfig; 3],
+        }
+
+        let example: Example = toml::from_str(
+            r#"
+key_gestures = [
+  { depth_actions = [{ at = 0.33, action = "light" }, { at = 0.66, action = "deep" }] },
+  {},
+  {}
+]
+"#,
+        )
+        .unwrap();
+        assert_eq!(example.key_gestures[0].depth_actions.len(), 2);
+        assert!(example.key_gestures[1].depth_actions.is_empty());
     }
 
     #[test]

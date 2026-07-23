@@ -24,6 +24,8 @@ combo_hold_ms = 350
 key_hold_ms = 350
 # Maximum gap between the first release and second press of a double-tap.
 double_tap_ms = 250
+# Upward travel required before a peak-depth action fires.
+depth_reversal_hysteresis = 0.04
 
 hall_keys = [
   { row = 2, col = 1 },
@@ -54,11 +56,29 @@ unknown = "#19191e"
 name = "Agents"
 color = "#7c6cff"
 actions = ["thread.jump.1", "thread.jump.2", "thread.jump.3"]
+# Optional HE timing gestures. Entries are left, middle, right. Omitted
+# actions and thresholds inherit normal tap behavior and global thresholds.
+# key_gestures = [
+#   { hold_action = "chat.new", double_tap_action = "thread.jump.4", actuation_threshold = 0.70, release_threshold = 0.20 },
+#   {},
+#   {},
+# ]
+#
+# Peak-depth mode is an alternative to hold/double-tap on the same key. It
+# fires only the deepest matching action when the key starts moving upward.
+# key_gestures = [
+#   { depth_actions = [{ at = 0.33, action = "thread.jump.1" }, { at = 0.66, action = "thread.jump.2" }, { at = 0.95, action = "thread.jump.3" }] },
+#   {},
+#   {},
+# ]
+# To handle travel below 0.33, add actuation_threshold = 0.20 and
+# depth_fallback_action = "app.activate" to the first entry.
 
 [targets.t3.layers.hold]
 name = "More agents"
 color = "#d06cff"
 actions = ["thread.jump.4", "thread.jump.5", "thread.jump.6"]
+# The same optional key_gestures field is supported inside hold maps.
 
 [[targets.t3.layers]]
 name = "Chat"

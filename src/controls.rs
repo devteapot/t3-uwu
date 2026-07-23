@@ -14,11 +14,12 @@ pub enum KeyRoute {
     Suppressed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum KeyGestureEvent {
     Tap,
     Hold,
     DoubleTap,
+    Depth { peak: f32 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -28,6 +29,9 @@ struct KeyPress {
     double_tap_enabled: bool,
     second_tap: bool,
     hold_emitted: bool,
+    depth_enabled: bool,
+    depth_emitted: bool,
+    peak_depth: f32,
 }
 
 #[derive(Default)]
@@ -42,6 +46,8 @@ impl KeyGestureController {
         now: Instant,
         hold_enabled: bool,
         double_tap_enabled: bool,
+        depth_enabled: bool,
+        value: f32,
         double_tap_duration: Duration,
     ) -> Option<KeyGestureEvent> {
         if self.press.is_some() {
@@ -60,14 +66,22 @@ impl KeyGestureController {
             double_tap_enabled,
             second_tap,
             hold_emitted: false,
+            depth_enabled,
+            depth_emitted: false,
+            peak_depth: value,
         });
-        (!hold_enabled && !double_tap_enabled).then_some(KeyGestureEvent::Tap)
+        (!hold_enabled && !double_tap_enabled && !depth_enabled).then_some(KeyGestureEvent::Tap)
     }
 
     pub fn released(&mut self, now: Instant) -> Option<KeyGestureEvent> {
         let press = self.press.take()?;
         if press.hold_emitted {
             return None;
+        }
+        if press.depth_enabled {
+            return (!press.depth_emitted).then_some(KeyGestureEvent::Depth {
+                peak: press.peak_depth,
+            });
         }
         if press.second_tap {
             return Some(KeyGestureEvent::DoubleTap);
@@ -84,7 +98,21 @@ impl KeyGestureController {
         now: Instant,
         hold_duration: Duration,
         double_tap_duration: Duration,
+        value: f32,
+        depth_reversal_hysteresis: f32,
     ) -> Option<KeyGestureEvent> {
+        if let Some(press) = self.press.as_mut()
+            && press.depth_enabled
+        {
+            press.peak_depth = press.peak_depth.max(value);
+            if !press.depth_emitted && press.peak_depth - value >= depth_reversal_hysteresis {
+                press.depth_emitted = true;
+                return Some(KeyGestureEvent::Depth {
+                    peak: press.peak_depth,
+                });
+            }
+            return None;
+        }
         if let Some(press) = self.press.as_mut()
             && press.hold_enabled
             && !press.hold_emitted
@@ -386,7 +414,7 @@ mod tests {
         let now = Instant::now();
         let mut key = KeyGestureController::default();
         assert_eq!(
-            key.pressed(now, false, false, DOUBLE_TAP),
+            key.pressed(now, false, false, false, 0.5, DOUBLE_TAP),
             Some(KeyGestureEvent::Tap)
         );
         assert_eq!(key.released(now + Duration::from_millis(20)), None);
@@ -397,9 +425,9 @@ mod tests {
     fn an_he_key_hold_suppresses_its_tap() {
         let now = Instant::now();
         let mut key = KeyGestureController::default();
-        assert_eq!(key.pressed(now, true, false, DOUBLE_TAP), None);
+        assert_eq!(key.pressed(now, true, false, false, 0.5, DOUBLE_TAP), None);
         assert_eq!(
-            key.update(now + HOLD, HOLD, DOUBLE_TAP),
+            key.update(now + HOLD, HOLD, DOUBLE_TAP, 0.5, 0.04),
             Some(KeyGestureEvent::Hold)
         );
         assert_eq!(key.released(now + HOLD), None);
@@ -409,10 +437,17 @@ mod tests {
     fn an_he_key_double_tap_suppresses_its_single_tap() {
         let now = Instant::now();
         let mut key = KeyGestureController::default();
-        assert_eq!(key.pressed(now, false, true, DOUBLE_TAP), None);
+        assert_eq!(key.pressed(now, false, true, false, 0.5, DOUBLE_TAP), None);
         assert_eq!(key.released(now + Duration::from_millis(20)), None);
         assert_eq!(
-            key.pressed(now + Duration::from_millis(80), false, true, DOUBLE_TAP),
+            key.pressed(
+                now + Duration::from_millis(80),
+                false,
+                true,
+                false,
+                0.5,
+                DOUBLE_TAP,
+            ),
             None
         );
         assert_eq!(
@@ -426,15 +461,42 @@ mod tests {
     fn an_he_key_single_tap_fires_after_the_double_tap_window() {
         let now = Instant::now();
         let mut key = KeyGestureController::default();
-        key.pressed(now, false, true, DOUBLE_TAP);
+        key.pressed(now, false, true, false, 0.5, DOUBLE_TAP);
         key.released(now + Duration::from_millis(20));
         assert_eq!(
             key.update(
                 now + Duration::from_millis(20) + DOUBLE_TAP,
                 HOLD,
-                DOUBLE_TAP
+                DOUBLE_TAP,
+                0.0,
+                0.04,
             ),
             Some(KeyGestureEvent::Tap)
+        );
+    }
+
+    #[test]
+    fn a_depth_key_fires_once_when_upward_travel_crosses_hysteresis() {
+        let now = Instant::now();
+        let mut key = KeyGestureController::default();
+        assert_eq!(key.pressed(now, false, false, true, 0.34, DOUBLE_TAP), None);
+        assert_eq!(key.update(now, HOLD, DOUBLE_TAP, 0.72, 0.04), None);
+        assert_eq!(
+            key.update(now, HOLD, DOUBLE_TAP, 0.67, 0.04),
+            Some(KeyGestureEvent::Depth { peak: 0.72 })
+        );
+        assert_eq!(key.update(now, HOLD, DOUBLE_TAP, 0.30, 0.04), None);
+        assert_eq!(key.released(now), None);
+    }
+
+    #[test]
+    fn a_depth_key_resolves_on_release_when_no_reversal_sample_arrives() {
+        let now = Instant::now();
+        let mut key = KeyGestureController::default();
+        key.pressed(now, false, false, true, 0.35, DOUBLE_TAP);
+        assert_eq!(
+            key.released(now + Duration::from_millis(30)),
+            Some(KeyGestureEvent::Depth { peak: 0.35 })
         );
     }
 }
