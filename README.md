@@ -21,6 +21,17 @@ Releasing the button returns from the hold layer. A target switch triggered
 from a hold layer is applied only after release, so the gesture cannot leak
 into the newly selected target.
 
+Double-tap a button to invoke its target-specific `double_tap_action`. By
+default, double-tapping the middle button cycles between T3 and Codex while the
+left and right double-taps are unassigned. The middle button's single tap is
+committed after the 250 ms double-tap window expires; buttons without a
+double-tap binding still select their layers immediately.
+
+HE keys can also have optional hold and double-tap actions, including
+per-key analog actuation and release thresholds. These advanced HE gestures are
+unassigned in both default target maps, so the default tap actions still fire
+immediately on actuation.
+
 Default persistent layers:
 
 | Button / layer | Left HE key | Middle HE key | Right HE key |
@@ -174,8 +185,43 @@ cargo run -- --config uwu-vibe.toml
 ```
 
 Each `[targets.<id>]` owns an accent, a full status palette, and exactly three
-layers. Every layer has three base actions and a three-action hold map. The
-included targets are `t3` and `codex`; adding another target now has a single
+layers. Every layer has three base actions, an optional button
+`double_tap_action`, and a three-action button-hold map. Omitted gesture actions
+are disabled; writing `"none"` remains accepted for older configurations but
+is unnecessary.
+
+`double_tap_ms` controls the recognition window and accepts values from 100
+through 1000 ms. `key_hold_ms` controls HE-key holds and accepts values from 100
+through 5000 ms. An HE key only delays its ordinary tap when that key has a
+hold or double-tap action.
+
+Advanced HE behavior is configured per layer and per key. This example assigns
+gestures only to the first HE key; the other two entries inherit the ordinary
+tap behavior and global thresholds:
+
+```toml
+[[targets.codex.layers]]
+name = "Agents"
+color = "#10a37f"
+actions = ["thread.jump.1", "thread.jump.2", "thread.jump.3"]
+key_gestures = [
+  { hold_action = "chat.new", double_tap_action = "thread.jump.4", actuation_threshold = 0.70, release_threshold = 0.20 },
+  {},
+  {}
+]
+
+[targets.codex.layers.hold]
+name = "More agents"
+color = "#48c6a9"
+actions = ["thread.jump.4", "thread.jump.5", "thread.jump.6"]
+```
+
+The same `key_gestures` field can be placed in a layer's `.hold` table.
+Actuation and release values range from `0.0` to `1.0`, and release must remain
+below actuation. Each omitted threshold inherits the global
+`actuation_threshold` or `release_threshold`.
+
+The included targets are `t3` and `codex`; adding another target has a single
 adapter boundary for state and action dispatch rather than requiring changes
 throughout the input and RGB loops.
 

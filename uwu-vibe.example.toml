@@ -20,6 +20,10 @@ release_threshold = 0.18
 brightness = 0.65
 poll_interval_ms = 750
 combo_hold_ms = 350
+# How long an HE key with a hold action must remain actuated.
+key_hold_ms = 350
+# Maximum gap between the first release and second press of a double-tap.
+double_tap_ms = 250
 
 hall_keys = [
   { row = 2, col = 1 },
@@ -60,6 +64,7 @@ actions = ["thread.jump.4", "thread.jump.5", "thread.jump.6"]
 name = "Chat"
 color = "#24c8db"
 actions = ["chat.new", "commandPalette.toggle", "diff.toggle"]
+double_tap_action = "target.next"
 
 [targets.t3.layers.hold]
 name = "Navigate"
@@ -103,6 +108,7 @@ actions = ["thread.jump.4", "thread.jump.5", "thread.jump.6"]
 name = "Chat"
 color = "#4388ff"
 actions = ["chat.new", "commandPalette.toggle", "diff.toggle"]
+double_tap_action = "target.next"
 
 [targets.codex.layers.hold]
 name = "Navigate"

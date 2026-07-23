@@ -26,7 +26,7 @@ use hidapi::HidApi;
 
 use codex::CodexState;
 use config::Config;
-use controls::{ControllerEvent, KeyRoute, LayerController};
+use controls::{ControllerEvent, KeyGestureController, KeyGestureEvent, KeyRoute, LayerController};
 use hardware::{Position, Trigger, TriggerTransition, UwUInput};
 use rgb::{EDGE_POSITIONS, LED_POSITIONS, Rgb, UwURgb};
 use t3::T3State;
@@ -263,6 +263,18 @@ struct TargetRuntime {
     last_error_at: Option<Instant>,
 }
 
+#[derive(Clone)]
+struct ResolvedKeyBinding {
+    target: TargetId,
+    map_name: String,
+    tap_action: String,
+    hold_action: Option<String>,
+    double_tap_action: Option<String>,
+    actuation_threshold: f32,
+    release_threshold: f32,
+    is_combo: bool,
+}
+
 fn run(config: Config) -> Result<()> {
     let api = HidApi::new().context("failed to initialize HID access")?;
     let mut input = UwUInput::open(&api)?;
@@ -276,6 +288,9 @@ fn run(config: Config) -> Result<()> {
     let mut pending_target = None;
     let mut target_switched_at = Some(Instant::now());
     let mut hall_triggers = [Trigger::default(); 3];
+    let mut key_gestures: [KeyGestureController; 3] =
+        std::array::from_fn(|_| KeyGestureController::default());
+    let mut key_bindings: [Option<ResolvedKeyBinding>; 3] = std::array::from_fn(|_| None);
     let mut button_triggers = [Trigger::default(); 3];
     let mut runtimes = HashMap::<TargetId, TargetRuntime>::new();
     let mut next_render = Instant::now();
@@ -292,6 +307,7 @@ fn run(config: Config) -> Result<()> {
         config.target(active_target).layers[0].name
     );
     eprintln!("Tap a button to select its layer; hold it to arm three combo actions.");
+    eprintln!("Double-tap the middle button to cycle targets.");
     eprintln!("Hold Tools and press the right HE key to cycle targets.");
     eprintln!("The active Wootility profile should leave all six controls unbound.");
     warn_if_wootility_is_running();
@@ -303,15 +319,44 @@ fn run(config: Config) -> Result<()> {
             let value = sample_value(samples, config.layer_buttons[index]);
             match trigger.transition(value, config.actuation_threshold, config.release_threshold) {
                 Some(TriggerTransition::Pressed) => {
-                    if let Some(event) = controller.button_pressed(index, now) {
-                        report_controller_event(event, &config, active_target);
+                    let double_tap_enabled = configured_action(
+                        config.target(active_target).layers[index]
+                            .double_tap_action
+                            .as_deref(),
+                    )
+                    .is_some();
+                    if let Some(event) = controller.button_pressed(
+                        index,
+                        now,
+                        Duration::from_millis(config.double_tap_ms),
+                        double_tap_enabled,
+                    ) {
+                        if handle_controller_event(
+                            event,
+                            &config,
+                            &mut active_target,
+                            &mut active_layers,
+                            &mut controller,
+                            &runtimes,
+                        )? {
+                            target_switched_at = Some(now);
+                        }
                         next_render = now;
                     }
                 }
                 Some(TriggerTransition::Released) => {
                     let was_armed = controller.combo_layer().is_some();
-                    if let Some(event) = controller.button_released(index) {
-                        report_controller_event(event, &config, active_target);
+                    if let Some(event) = controller.button_released(index, now) {
+                        if handle_controller_event(
+                            event,
+                            &config,
+                            &mut active_target,
+                            &mut active_layers,
+                            &mut controller,
+                            &runtimes,
+                        )? {
+                            target_switched_at = Some(now);
+                        }
                         next_render = now;
                     } else if was_armed {
                         next_render = now;
@@ -333,68 +378,108 @@ fn run(config: Config) -> Result<()> {
                 None => {}
             }
         }
-        if let Some(event) = controller.update(now, Duration::from_millis(config.combo_hold_ms)) {
-            report_controller_event(event, &config, active_target);
+        if let Some(event) = controller.update(
+            now,
+            Duration::from_millis(config.combo_hold_ms),
+            Duration::from_millis(config.double_tap_ms),
+        ) {
+            if handle_controller_event(
+                event,
+                &config,
+                &mut active_target,
+                &mut active_layers,
+                &mut controller,
+                &runtimes,
+            )? {
+                target_switched_at = Some(now);
+            }
             next_render = now;
         }
-        for (index, trigger) in hall_triggers.iter_mut().enumerate() {
+        for index in 0..hall_triggers.len() {
             let value = sample_value(samples, config.hall_keys[index]);
-            if trigger.update(value, config.actuation_threshold, config.release_threshold) {
-                let route = controller.key_pressed(index);
-                let (name, action, is_combo) = match route {
-                    KeyRoute::Base { layer, key } => {
-                        let layer = &config.target(active_target).layers[layer];
-                        (layer.name.clone(), layer.actions[key].clone(), false)
+            let (actuation_threshold, release_threshold) =
+                key_bindings[index].as_ref().map_or_else(
+                    || current_key_thresholds(&config, active_target, &controller, index),
+                    |binding| (binding.actuation_threshold, binding.release_threshold),
+                );
+            match hall_triggers[index].transition(value, actuation_threshold, release_threshold) {
+                Some(TriggerTransition::Pressed) => {
+                    if key_bindings[index].is_none() {
+                        key_bindings[index] =
+                            resolve_key_binding(&config, active_target, &mut controller, index);
                     }
-                    KeyRoute::Combo { layer, key } => {
-                        let layer = &config.target(active_target).layers[layer];
-                        (
-                            layer.hold.name.clone(),
-                            layer.hold.actions[key].clone(),
-                            true,
-                        )
-                    }
-                    KeyRoute::Suppressed => {
+                    let Some(binding) = key_bindings[index].as_ref() else {
                         eprintln!("combo not armed yet, or a target switch is pending");
                         continue;
-                    }
-                };
-                eprintln!(
-                    "{} / {} / key {} -> {}",
-                    active_target,
-                    name,
-                    index + 1,
-                    action
-                );
-                if let Some(command) = TargetCommand::parse(&action) {
-                    if is_combo {
-                        pending_target = Some(command);
-                        controller.suppress_keys_until_release();
-                        eprintln!("target switch queued until the layer button is released");
-                    } else {
-                        switch_target(
-                            command,
+                    };
+                    if let Some(event) = key_gestures[index].pressed(
+                        now,
+                        binding.hold_action.is_some(),
+                        binding.double_tap_action.is_some(),
+                        Duration::from_millis(config.double_tap_ms),
+                    ) {
+                        let binding = binding.clone();
+                        if dispatch_key_gesture(
+                            event,
+                            index,
+                            &binding,
                             &config,
                             &mut active_target,
                             &mut active_layers,
                             &mut controller,
-                        )?;
+                            &mut pending_target,
+                            &runtimes,
+                        )? {
+                            target_switched_at = Some(now);
+                        }
+                    }
+                }
+                Some(TriggerTransition::Released) => {
+                    if let Some(event) = key_gestures[index].released(now)
+                        && let Some(binding) = key_bindings[index].clone()
+                        && dispatch_key_gesture(
+                            event,
+                            index,
+                            &binding,
+                            &config,
+                            &mut active_target,
+                            &mut active_layers,
+                            &mut controller,
+                            &mut pending_target,
+                            &runtimes,
+                        )?
+                    {
                         target_switched_at = Some(now);
                     }
-                    next_render = now;
-                    continue;
+                    if key_gestures[index].is_idle() {
+                        key_bindings[index] = None;
+                    }
                 }
-                let slots = runtimes
-                    .get(&active_target)
-                    .map_or(&[][..], |runtime| runtime.slots.as_slice());
-                if let Err(error) = actions::run(
-                    active_target,
-                    &action,
-                    app_name(&config, active_target),
-                    slots,
-                ) {
-                    eprintln!("action error: {error:#}");
-                }
+                None => {}
+            }
+        }
+        for index in 0..key_gestures.len() {
+            if let Some(event) = key_gestures[index].update(
+                now,
+                Duration::from_millis(config.key_hold_ms),
+                Duration::from_millis(config.double_tap_ms),
+            ) && let Some(binding) = key_bindings[index].clone()
+                && dispatch_key_gesture(
+                    event,
+                    index,
+                    &binding,
+                    &config,
+                    &mut active_target,
+                    &mut active_layers,
+                    &mut controller,
+                    &mut pending_target,
+                    &runtimes,
+                )?
+            {
+                target_switched_at = Some(now);
+            }
+            if key_gestures[index].is_idle() {
+                key_bindings[index] = None;
             }
         }
 
@@ -489,26 +574,192 @@ fn switch_target(
     Ok(())
 }
 
-fn report_controller_event(event: ControllerEvent, config: &Config, target: TargetId) {
+fn handle_controller_event(
+    event: ControllerEvent,
+    config: &Config,
+    active_target: &mut TargetId,
+    active_layers: &mut HashMap<TargetId, usize>,
+    controller: &mut LayerController,
+    runtimes: &HashMap<TargetId, TargetRuntime>,
+) -> Result<bool> {
     match event {
         ControllerEvent::LayerSelected(layer) => {
             eprintln!(
                 "{} layer {}: {}",
-                target,
+                active_target,
                 layer + 1,
-                config.target(target).layers[layer].name
+                config.target(*active_target).layers[layer].name
             );
         }
         ControllerEvent::ComboArmed(layer) => {
-            let layer_config = &config.target(target).layers[layer];
+            let layer_config = &config.target(*active_target).layers[layer];
             eprintln!(
                 "{} hold layer {} armed: {}",
-                target,
+                active_target,
                 layer + 1,
                 layer_config.hold.name
             );
         }
+        ControllerEvent::DoubleTapped(layer) => {
+            let Some(action) = configured_action(
+                config.target(*active_target).layers[layer]
+                    .double_tap_action
+                    .as_deref(),
+            ) else {
+                return Ok(false);
+            };
+            let action = action.to_owned();
+            eprintln!(
+                "{} button {} double-tap -> {}",
+                active_target,
+                layer + 1,
+                action
+            );
+            if let Some(command) = TargetCommand::parse(&action) {
+                let previous = *active_target;
+                switch_target(command, config, active_target, active_layers, controller)?;
+                return Ok(previous != *active_target);
+            }
+            let slots = runtimes
+                .get(active_target)
+                .map_or(&[][..], |runtime| runtime.slots.as_slice());
+            if let Err(error) = actions::run(
+                *active_target,
+                &action,
+                app_name(config, *active_target),
+                slots,
+            ) {
+                eprintln!("double-tap action error: {error:#}");
+            }
+        }
     }
+    Ok(false)
+}
+
+fn current_key_thresholds(
+    config: &Config,
+    target: TargetId,
+    controller: &LayerController,
+    key: usize,
+) -> (f32, f32) {
+    let target_config = config.target(target);
+    let gesture = if let Some(layer) = controller.combo_layer() {
+        &target_config.layers[layer].hold.key_gestures[key]
+    } else {
+        &target_config.layers[controller.active_layer()].key_gestures[key]
+    };
+    (
+        gesture
+            .actuation_threshold
+            .unwrap_or(config.actuation_threshold),
+        gesture
+            .release_threshold
+            .unwrap_or(config.release_threshold),
+    )
+}
+
+fn resolve_key_binding(
+    config: &Config,
+    target: TargetId,
+    controller: &mut LayerController,
+    key: usize,
+) -> Option<ResolvedKeyBinding> {
+    let target_config = config.target(target);
+    let (map_name, tap_action, gesture, is_combo) = match controller.key_pressed(key) {
+        KeyRoute::Base { layer, key } => {
+            let map = &target_config.layers[layer];
+            (
+                map.name.clone(),
+                map.actions[key].clone(),
+                &map.key_gestures[key],
+                false,
+            )
+        }
+        KeyRoute::Combo { layer, key } => {
+            let map = &target_config.layers[layer].hold;
+            (
+                map.name.clone(),
+                map.actions[key].clone(),
+                &map.key_gestures[key],
+                true,
+            )
+        }
+        KeyRoute::Suppressed => return None,
+    };
+    Some(ResolvedKeyBinding {
+        target,
+        map_name,
+        tap_action,
+        hold_action: configured_action(gesture.hold_action.as_deref()).map(str::to_owned),
+        double_tap_action: configured_action(gesture.double_tap_action.as_deref())
+            .map(str::to_owned),
+        actuation_threshold: gesture
+            .actuation_threshold
+            .unwrap_or(config.actuation_threshold),
+        release_threshold: gesture
+            .release_threshold
+            .unwrap_or(config.release_threshold),
+        is_combo,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_key_gesture(
+    event: KeyGestureEvent,
+    key: usize,
+    binding: &ResolvedKeyBinding,
+    config: &Config,
+    active_target: &mut TargetId,
+    active_layers: &mut HashMap<TargetId, usize>,
+    controller: &mut LayerController,
+    pending_target: &mut Option<TargetCommand>,
+    runtimes: &HashMap<TargetId, TargetRuntime>,
+) -> Result<bool> {
+    let (gesture_name, action) = match event {
+        KeyGestureEvent::Tap => ("tap", Some(binding.tap_action.as_str())),
+        KeyGestureEvent::Hold => ("hold", binding.hold_action.as_deref()),
+        KeyGestureEvent::DoubleTap => ("double-tap", binding.double_tap_action.as_deref()),
+    };
+    let Some(action) = action else {
+        return Ok(false);
+    };
+    eprintln!(
+        "{} / {} / key {} {} -> {}",
+        binding.target,
+        binding.map_name,
+        key + 1,
+        gesture_name,
+        action
+    );
+    if let Some(command) = TargetCommand::parse(action) {
+        if binding.is_combo && controller.gesture_active() {
+            *pending_target = Some(command);
+            controller.suppress_keys_until_release();
+            eprintln!("target switch queued until the layer button is released");
+            return Ok(false);
+        }
+        let previous = *active_target;
+        switch_target(command, config, active_target, active_layers, controller)?;
+        return Ok(previous != *active_target);
+    }
+    let slots = runtimes
+        .get(&binding.target)
+        .map_or(&[][..], |runtime| runtime.slots.as_slice());
+    if let Err(error) = actions::run(
+        binding.target,
+        action,
+        app_name(config, binding.target),
+        slots,
+    ) {
+        eprintln!("key gesture action error: {error:#}");
+    }
+    Ok(false)
+}
+
+fn configured_action(action: Option<&str>) -> Option<&str> {
+    action
+        .map(str::trim)
+        .filter(|action| !action.is_empty() && *action != "none")
 }
 
 enum StateUpdate {

@@ -45,6 +45,8 @@ pub struct Config {
     pub brightness: f32,
     pub poll_interval_ms: u64,
     pub combo_hold_ms: u64,
+    pub key_hold_ms: u64,
+    pub double_tap_ms: u64,
     pub hall_keys: [Position; 3],
     pub layer_buttons: [Position; 3],
 
@@ -112,7 +114,26 @@ pub struct LayerConfig {
     pub name: String,
     pub color: String,
     pub actions: [String; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub double_tap_action: Option<String>,
+    #[serde(
+        default = "default_key_gestures",
+        skip_serializing_if = "key_gestures_are_unset"
+    )]
+    pub key_gestures: [KeyGestureConfig; 3],
     pub hold: HoldLayerConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct KeyGestureConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub double_tap_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actuation_threshold: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_threshold: Option<f32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -120,6 +141,11 @@ pub struct HoldLayerConfig {
     pub name: String,
     pub color: String,
     pub actions: [String; 3],
+    #[serde(
+        default = "default_key_gestures",
+        skip_serializing_if = "key_gestures_are_unset"
+    )]
+    pub key_gestures: [KeyGestureConfig; 3],
 }
 
 impl Default for TargetsConfig {
@@ -152,6 +178,8 @@ impl Default for Config {
             brightness: 0.65,
             poll_interval_ms: 750,
             combo_hold_ms: 350,
+            key_hold_ms: 350,
+            double_tap_ms: 250,
             hall_keys: [
                 Position::new(2, 1),
                 Position::new(2, 3),
@@ -221,6 +249,14 @@ impl Config {
             "combo_hold_ms must be between 100 and 5000"
         );
         anyhow::ensure!(
+            (100..=5000).contains(&self.key_hold_ms),
+            "key_hold_ms must be between 100 and 5000"
+        );
+        anyhow::ensure!(
+            (100..=1000).contains(&self.double_tap_ms),
+            "double_tap_ms must be between 100 and 1000"
+        );
+        anyhow::ensure!(
             !self.codex_bin.trim().is_empty(),
             "codex_bin cannot be empty"
         );
@@ -253,7 +289,40 @@ impl Config {
             crate::rgb::Rgb::from_hex(&layer.hold.color).with_context(|| {
                 format!("invalid hold color for target {id} layer {}", layer.name)
             })?;
+            for (index, key) in layer.key_gestures.iter().enumerate() {
+                self.validate_key_thresholds(id, &layer.name, index, key)?;
+            }
+            for (index, key) in layer.hold.key_gestures.iter().enumerate() {
+                self.validate_key_thresholds(id, &layer.hold.name, index, key)?;
+            }
         }
+        Ok(())
+    }
+
+    fn validate_key_thresholds(
+        &self,
+        id: TargetId,
+        map_name: &str,
+        index: usize,
+        key: &KeyGestureConfig,
+    ) -> Result<()> {
+        let actuation = key.actuation_threshold.unwrap_or(self.actuation_threshold);
+        let release = key.release_threshold.unwrap_or(self.release_threshold);
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&actuation),
+            "invalid actuation threshold for target {id} map {map_name} key {}",
+            index + 1
+        );
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&release),
+            "invalid release threshold for target {id} map {map_name} key {}",
+            index + 1
+        );
+        anyhow::ensure!(
+            release < actuation,
+            "release threshold must be below actuation threshold for target {id} map {map_name} key {}",
+            index + 1
+        );
         Ok(())
     }
 }
@@ -319,30 +388,39 @@ fn standard_layers(
             name: "Agents".into(),
             color: "#7c6cff".into(),
             actions: strings(["thread.jump.1", "thread.jump.2", "thread.jump.3"]),
+            double_tap_action: None,
+            key_gestures: default_key_gestures(),
             hold: HoldLayerConfig {
                 name: "More agents".into(),
                 color: "#d06cff".into(),
                 actions: strings(["thread.jump.4", "thread.jump.5", "thread.jump.6"]),
+                key_gestures: default_key_gestures(),
             },
         },
         LayerConfig {
             name: "Chat".into(),
             color: "#24c8db".into(),
             actions: strings(chat_actions),
+            double_tap_action: Some("target.next".into()),
+            key_gestures: default_key_gestures(),
             hold: HoldLayerConfig {
                 name: "Navigate".into(),
                 color: "#24db8f".into(),
                 actions: strings(navigation_actions),
+                key_gestures: default_key_gestures(),
             },
         },
         LayerConfig {
             name: "Tools".into(),
             color: "#ff9f43".into(),
             actions: strings(tool_actions),
+            double_tap_action: None,
+            key_gestures: default_key_gestures(),
             hold: HoldLayerConfig {
                 name: "Workspace".into(),
                 color: "#ff5f57".into(),
                 actions: strings(["sidebar.toggle", "rightPanel.toggle", "target.next"]),
+                key_gestures: default_key_gestures(),
             },
         },
     ]
@@ -350,6 +428,16 @@ fn standard_layers(
 
 fn strings(values: [&str; 3]) -> [String; 3] {
     values.map(str::to_owned)
+}
+
+fn default_key_gestures() -> [KeyGestureConfig; 3] {
+    std::array::from_fn(|_| KeyGestureConfig::default())
+}
+
+fn key_gestures_are_unset(gestures: &[KeyGestureConfig; 3]) -> bool {
+    gestures
+        .iter()
+        .all(|gesture| gesture == &KeyGestureConfig::default())
 }
 
 #[cfg(test)]
@@ -366,6 +454,10 @@ mod tests {
         assert_eq!(
             decoded.targets.codex.layers[2].hold.actions[2],
             "target.next"
+        );
+        assert_eq!(
+            decoded.targets.codex.layers[1].double_tap_action,
+            Some("target.next".into())
         );
         assert_eq!(decoded.layer_buttons[2], Position::new(3, 4));
     }
@@ -387,6 +479,55 @@ mod tests {
         let decoded = Config::load(Some(&path)).unwrap();
         fs::remove_file(path).unwrap();
         assert_eq!(decoded.targets.t3.layers[0].name, "Legacy");
+    }
+
+    #[test]
+    fn config_without_double_tap_fields_remains_valid() {
+        let encoded = toml::to_string(&Config::default())
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                !line.starts_with("double_tap_ms") && !line.starts_with("double_tap_action")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let decoded: Config = toml::from_str(&encoded).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded.double_tap_ms, 250);
+        assert!(
+            decoded
+                .targets
+                .t3
+                .layers
+                .iter()
+                .all(|layer| layer.double_tap_action.is_none())
+        );
+    }
+
+    #[test]
+    fn per_key_gestures_and_thresholds_round_trip() {
+        let mut config = Config::default();
+        config.targets.codex.layers[0].key_gestures[0] = KeyGestureConfig {
+            hold_action: Some("chat.new".into()),
+            double_tap_action: Some("thread.jump.4".into()),
+            actuation_threshold: Some(0.7),
+            release_threshold: Some(0.2),
+        };
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: Config = toml::from_str(&encoded).unwrap();
+        decoded.validate().unwrap();
+        let gesture = &decoded.targets.codex.layers[0].key_gestures[0];
+        assert_eq!(gesture.hold_action.as_deref(), Some("chat.new"));
+        assert_eq!(gesture.actuation_threshold, Some(0.7));
+        assert_eq!(gesture.release_threshold, Some(0.2));
+    }
+
+    #[test]
+    fn per_key_release_must_be_below_actuation() {
+        let mut config = Config::default();
+        config.targets.t3.layers[0].key_gestures[0].actuation_threshold = Some(0.5);
+        config.targets.t3.layers[0].key_gestures[0].release_threshold = Some(0.6);
+        assert!(config.validate().is_err());
     }
 
     #[test]

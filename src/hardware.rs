@@ -121,10 +121,6 @@ pub enum TriggerTransition {
 }
 
 impl Trigger {
-    pub fn update(&mut self, value: f32, press: f32, release: f32) -> bool {
-        self.transition(value, press, release) == Some(TriggerTransition::Pressed)
-    }
-
     pub fn transition(
         &mut self,
         value: f32,
@@ -150,12 +146,21 @@ mod tests {
     #[test]
     fn trigger_has_hysteresis_and_only_fires_once() {
         let mut trigger = Trigger::default();
-        assert!(!trigger.update(0.2, 0.4, 0.15));
-        assert!(trigger.update(0.5, 0.4, 0.15));
-        assert!(!trigger.update(0.8, 0.4, 0.15));
-        assert!(!trigger.update(0.2, 0.4, 0.15));
-        assert!(!trigger.update(0.1, 0.4, 0.15));
-        assert!(trigger.update(0.5, 0.4, 0.15));
+        assert_eq!(trigger.transition(0.2, 0.4, 0.15), None);
+        assert_eq!(
+            trigger.transition(0.5, 0.4, 0.15),
+            Some(TriggerTransition::Pressed)
+        );
+        assert_eq!(trigger.transition(0.8, 0.4, 0.15), None);
+        assert_eq!(trigger.transition(0.2, 0.4, 0.15), None);
+        assert_eq!(
+            trigger.transition(0.1, 0.4, 0.15),
+            Some(TriggerTransition::Released)
+        );
+        assert_eq!(
+            trigger.transition(0.5, 0.4, 0.15),
+            Some(TriggerTransition::Pressed)
+        );
     }
 
     #[test]
