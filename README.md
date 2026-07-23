@@ -1,25 +1,27 @@
-# t3-uwu
+# uwu-vibe
 
-Turn a Wooting UwU RGB into a small, layered T3 Code controller with live Codex
-status lighting.
+Turn a Wooting UwU RGB into a modal controller for T3 Code and Codex, with
+per-target keymaps and live agent-status lighting.
 
-This build is Mac-first: it reads the UwU's raw analog HID reports, observes T3
-Code through its authenticated read-only API (with a local SQLite compatibility
-fallback), drives the UwU's RGB interface, and invokes T3's existing keyboard
-commands.
+This build is Mac-first. It reads the UwU's raw analog HID reports, observes T3
+through its authenticated read-only API (with a SQLite fallback), observes
+Codex through `codex app-server`, drives the UwU RGB interface, and invokes the
+active app's existing commands.
 
-## Default layout
+## Targets and layers
+
+The controller has two independent modes: T3 and Codex. Each target keeps its
+own active layer, actions, layer colors, and status palette. Switching target
+flashes the target accent across the device; the four top-edge LEDs retain that
+accent afterward.
 
 Tap one of the three small buttons to select its persistent layer. Hold a
-button for 350 ms to arm its temporary hold layer, then press any of the three
-HE keys. Releasing the button returns to the previously selected layer, whether
-or not an HE action was triggered. Only a release before the hold layer arms
-selects that layer persistently.
+button for 350 ms to arm its temporary hold layer, then press an HE key.
+Releasing the button returns from the hold layer. A target switch triggered
+from a hold layer is applied only after release, so the gesture cannot leak
+into the newly selected target.
 
-The selected layer button is white. When a hold layer arms, the button and HE
-keys change color so the mode switch is visible before an action fires.
-
-Persistent layers:
+Default persistent layers:
 
 | Button / layer | Left HE key | Middle HE key | Right HE key |
 |---|---|---|---|
@@ -27,134 +29,177 @@ Persistent layers:
 | 2 — Chat | New chat | Command palette | Diff panel |
 | 3 — Tools | Terminal | Preview | Model picker |
 
-Hold layers:
+Default hold layers:
 
 | Hold button | Left HE key | Middle HE key | Right HE key |
 |---|---|---|---|
 | 1 — More agents | Thread 4 | Thread 5 | Thread 6 |
 | 2 — Navigate | Previous thread | Next thread | New local chat |
-| 3 — Workspace | Sidebar | Right panel | Focus T3 Code |
+| 3 — Workspace | Sidebar | Right panel | Cycle target |
 
-On the Agents layer, the main key LEDs reflect the first three threads in T3's
-current sidebar-v2 ordering: active threads in newest-created order, followed
-by the settled tail. This matches the targets of T3's `Cmd+1` through `Cmd+3`
-shortcuts when the sidebar is unscoped:
+`target.next` (also spelled `target.cycle`), `target.previous`,
+`target.select.t3`, and `target.select.codex` can be assigned anywhere in a
+target keymap. `default_target` and `target_order` control startup and cycling.
+
+On the Agents layer, the three HE LEDs use the active target's status palette:
 
 - blue: running or starting
 - orange: waiting for approval
 - yellow: waiting for input
-- green: completed/ready
+- green: completed
 - red: failed
-- dim: no thread/unknown
+- the target's idle/unknown color: idle or no thread
 
-The mapping exposes 18 actions while keeping the three top buttons useful as
-ordinary layer selectors. The HE input path also preserves analog travel, so
-dual-stage or press-depth gestures can be added without a hardware change.
+T3 thread keys use its numbered keyboard shortcuts. Codex thread keys read the
+six most recent local threads from app-server and open the selected technical
+thread ID through the desktop app's `codex://threads/<id>` deep link.
 
 ## Build and run
 
-Requirements: macOS, Rust, T3 Code, and a Wooting UwU RGB.
+Requirements: macOS, Rust, a Wooting UwU RGB, and either T3 Code, Codex, or
+both. Codex support expects the `codex` CLI to be on `PATH`.
 
 ```sh
-git clone https://github.com/devteapot/t3-uwu.git
-cd t3-uwu
+git clone https://github.com/devteapot/uwu-vibe.git
+cd uwu-vibe
+cargo build --release
 ```
 
-First create a dedicated profile in Wootility and remove the keyboard binding
-from all three HE keys and all three top buttons. Save that profile to the UwU.
-The firmware continues exposing their physical state through the analog HID
-interface, but they will no longer type their old bindings alongside the bridge
-actions. Wootility may warn that unbound keys will not input anything; that is
-intentional for this profile.
+Create a dedicated Wootility profile and remove the keyboard binding from all
+three HE keys and all three top buttons. Save that profile to the device, then
+quit Wootility so it does not reclaim the RGB interface.
 
-After saving the profile, quit Wootility before starting `t3-uwu`. Wootility
-can reclaim the RGB interface and replace the bridge's status colors even when
-the HID writes themselves report success. The daemon prints a warning when it
-detects Wootility running.
+Useful checks:
 
 ```sh
-cargo build --release
 cargo run -- diagnose
+cargo run -- diagnose --watch
 cargo run -- test-rgb
 cargo run -- reset-rgb
-cargo run -- action thread.jump.1
-cargo run -- t3-state
+cargo run -- state t3
+cargo run -- state codex
+cargo run -- action chat.new --target codex
 cargo run
 ```
 
-The first action may prompt for macOS Accessibility permission because the
-bridge activates T3 Code and sends its configured keyboard shortcut through
-System Events. Grant permission to the terminal (or to the packaged app when we
-add one) under **System Settings → Privacy & Security → Accessibility**.
-The `action` command is the quickest way to verify that permission separately
-from the hardware input path.
+The first shortcut action may prompt for macOS Accessibility permission. Enable
+the terminal (or packaged app) that launched `uwu-vibe` under **System Settings →
+Privacy & Security → Accessibility**, then restart that application. Codex
+thread selection and new-chat actions use desktop deep links and do not require
+keystroke permission.
 
-### Pair with the T3 API
+## T3 state setup
 
-Pairing is optional but recommended. Without it, `t3-uwu` continues to use the
-local read-only SQLite observer.
+Pairing is optional but recommended. Without it, `uwu-vibe` uses the local
+read-only SQLite observer.
 
-In T3 Code, create a client pairing link under its remote-access settings. Then
-run the command below and paste the full link when prompted. Leaving the URL out
-of the command keeps its one-time credential out of shell history.
+Create a client pairing link in T3 Code's remote-access settings, then run:
 
 ```sh
 cargo run -- pair
-cargo run -- t3-state
+cargo run -- state t3
 ```
 
-The pairing credential is exchanged for `orchestration:read` access only. The
-resulting bearer token is saved in macOS Keychain; it is never written to the
-config file. `t3-state` prints `State source: T3 API` when the connection is
-active. If the credential is revoked or T3 is temporarily unreachable, `auto`
-mode falls back to SQLite and the running daemon reports the transition once.
-Run `cargo run -- unpair` to delete the locally saved credential.
+The pairing credential is exchanged for `orchestration:read` access and stored
+in macOS Keychain. It is never written to the config file. In `auto` mode, an
+unavailable API falls back to SQLite. Run `cargo run -- unpair` to delete the
+saved credential.
 
-For a remote T3 server, set `t3_http_url` in the config. For automation, a token
-can instead be supplied through `T3_UWU_BEARER_TOKEN` (or the environment
-variable named by `t3_bearer_token_env`).
+For a remote T3 server, set `t3_http_url`. For automation, a token can instead
+be supplied through `UWU_VIBE_T3_BEARER_TOKEN` (or the environment variable named
+by `t3_bearer_token_env`).
 
-Use `cargo run -- diagnose --watch` to verify matrix positions with concise
-press/release events. Add `--raw` to see the full analog travel stream. Press
-each HE key and top button; the default UwU RGB firmware layout is:
+## Codex state setup
+
+The baseline Codex adapter starts a read-only stdio app-server and uses
+`thread/list` plus `thread/read` to resolve the six latest local threads. This
+provides thread identity and settled state without modifying Codex.
+
+For immediate running, approval, input, and completion transitions across
+separate Codex processes, add lifecycle hooks. Every handler can use the same
+command; replace `/ABSOLUTE/PATH/uwu-vibe` with the release binary:
+
+```toml
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "/ABSOLUTE/PATH/uwu-vibe codex-hook"
+timeout = 5
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "/ABSOLUTE/PATH/uwu-vibe codex-hook"
+timeout = 5
+
+[[hooks.PermissionRequest]]
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "/ABSOLUTE/PATH/uwu-vibe codex-hook"
+timeout = 5
+
+[[hooks.PreToolUse]]
+matcher = "^request_user_input$"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/ABSOLUTE/PATH/uwu-vibe codex-hook"
+timeout = 5
+
+[[hooks.PostToolUse]]
+matcher = "^request_user_input$"
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "/ABSOLUTE/PATH/uwu-vibe codex-hook"
+timeout = 5
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "/ABSOLUTE/PATH/uwu-vibe codex-hook"
+timeout = 5
+```
+
+Put this in the `[hooks]` portion of `~/.codex/config.toml` for all projects,
+or in a trusted project's `.codex/config.toml`. Codex requires review of new
+command hooks; use `/hooks` to inspect and trust them. See the official
+[Codex hooks documentation](https://learn.chatgpt.com/docs/hooks) for lifecycle
+and trust details.
+
+## Configuration
+
+Copy `uwu-vibe.example.toml` to `uwu-vibe.toml`, edit it, and run:
+
+```sh
+cargo run -- --config uwu-vibe.toml
+```
+
+Each `[targets.<id>]` owns an accent, a full status palette, and exactly three
+layers. Every layer has three base actions and a three-action hold map. The
+included targets are `t3` and `codex`; adding another target now has a single
+adapter boundary for state and action dispatch rather than requiring changes
+throughout the input and RGB loops.
+
+Version 0.3 files with top-level `[[layers]]` still load: those entries replace
+only the T3 keymap, while Codex receives its defaults. Use the nested target
+shape in the example for new configurations.
+
+### Migrating from t3-uwu
+
+The binary and crate are now named `uwu-vibe`. Existing configuration contents
+remain valid when supplied with `--config`. The application also reads the old
+`T3_UWU_BEARER_TOKEN`, `devteapot.t3-uwu` Keychain entry, and `t3-uwu` Codex
+hook-state directory as fallbacks. New credentials and hook events use the
+`uwu-vibe` names.
+
+Update existing Codex hook commands to invoke `uwu-vibe codex-hook`. Running
+`uwu-vibe unpair` removes credentials stored under either project name.
+
+The default input positions are:
 
 - HE keys: `r2c1`, `r2c3`, `r2c5`
 - layer buttons: `r3c2`, `r3c3`, `r3c4`
 
-If your firmware exposes different positions, copy `t3-uwu.example.toml` to
-`t3-uwu.toml`, edit it, and run `cargo run -- --config t3-uwu.toml`.
-
-## Configuration and current limits
-
-Each of the exactly three `[[layers]]` entries requires a base `name`, `color`,
-and three `actions`, plus a `[layers.hold]` table with its own `name`, `color`,
-and three `actions`. `combo_hold_ms` controls the hold threshold and accepts
-values from 100 through 5000 ms. This configuration shape is new in v0.3 and
-older custom files must add the required hold tables; see
-`t3-uwu.example.toml` for a complete example.
-
-The action names supported in the example config are the T3 commands
-implemented by this prototype. They use T3's default macOS shortcuts, so
-customized T3 keybindings may need matching changes in `src/actions.rs` for
-now.
-
-The default `t3_state_source = "auto"` uses the authenticated shell-snapshot API
-after pairing and otherwise opens `t3_database` read-only. Set it to `"api"` to
-require API access or `"sqlite"` to force the compatibility backend. The local
-API URL is discovered through `t3_runtime`; `t3_http_url` overrides it.
-
-Thread selection and status reproduce the default, unscoped sidebar-v2 order.
-If a project scope chip is active in T3, `Cmd+1` through `Cmd+3` refer to that
-filtered view while this prototype still observes the global list. A future
-native T3 peripheral API should expose the exact visible order, selected
-thread, action dispatch, and a push event stream. Until that API exists, the
-read-only shell snapshot plus standard T3 shortcuts keep this build useful;
-SQLite remains available for older T3 releases and expired credentials.
-
-RGB control takes over while the process runs and restores the onboard Wooting
-effect when the process exits normally. During development, use Ctrl-C once and
-then run `cargo run -- reset-rgb` if a force-killed process leaves Wooting's RGB
-SDK-control flag in place. Ctrl-C, SIGTERM, and terminal hangup all use the
-normal cleanup path; SIGKILL and a power loss cannot run process cleanup.
+RGB control is released on normal exit. If a force-killed process leaves SDK
+control active, run `cargo run -- reset-rgb`.
 
 See [NOTICE](NOTICE) for protocol attribution.

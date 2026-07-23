@@ -1,17 +1,20 @@
 mod actions;
+mod codex;
 mod config;
 mod controls;
 mod hardware;
 mod rgb;
 mod t3;
+mod target;
 
 use std::{
     collections::HashMap,
+    io::Read,
     path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver},
+        mpsc::{self, Receiver, Sender},
     },
     thread,
     time::{Duration, Instant},
@@ -21,11 +24,13 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hidapi::HidApi;
 
+use codex::CodexState;
 use config::Config;
 use controls::{ControllerEvent, KeyRoute, LayerController};
 use hardware::{Position, Trigger, TriggerTransition, UwUInput};
 use rgb::{EDGE_POSITIONS, LED_POSITIONS, Rgb, UwURgb};
-use t3::{AgentPhase, StateSnapshot, T3State, ThreadSlot};
+use t3::T3State;
+use target::{StateSnapshot, StateSource, TargetCommand, TargetId, ThreadSlot};
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -51,20 +56,30 @@ enum Command {
     TestRgb,
     /// Release Wooting RGB SDK control and restore the onboard lighting effect.
     ResetRgb,
-    /// Print the three T3 thread slots and their resolved state.
+    /// Print the latest thread slots and their resolved state for one target.
+    State {
+        #[arg(value_enum, default_value = "t3")]
+        target: TargetId,
+    },
+    /// Print T3 state (compatibility alias for `state t3`).
     T3State,
     /// Exchange a T3 pairing link for read-only API access and save it in Keychain.
     Pair {
         /// Pairing URL from T3. Omit it to enter the URL without shell-history exposure.
         pairing_url: Option<String>,
     },
-    /// Remove t3-uwu's saved T3 API credential from Keychain.
+    /// Remove uwu-vibe's saved T3 API credential from Keychain.
     Unpair,
-    /// Send one supported action to T3 Code (useful for permission testing).
+    /// Send one supported action to a target (useful for permission testing).
     Action {
         /// For example: thread.jump.1, chat.new, or terminal.toggle.
         action: String,
+        /// Target to control. Defaults to `default_target`.
+        #[arg(long, value_enum)]
+        target: Option<TargetId>,
     },
+    /// Consume one Codex hook event from stdin and update live LED state.
+    CodexHook,
 }
 
 fn main() -> Result<()> {
@@ -75,10 +90,14 @@ fn main() -> Result<()> {
         Some(Command::Diagnose { watch, raw }) => diagnose(&config, watch, raw),
         Some(Command::TestRgb) => test_rgb(&config),
         Some(Command::ResetRgb) => reset_rgb(),
-        Some(Command::T3State) => print_t3_state(&config),
+        Some(Command::State { target }) => print_state(&config, target),
+        Some(Command::T3State) => print_state(&config, TargetId::T3),
         Some(Command::Pair { pairing_url }) => pair_t3(pairing_url.as_deref()),
         Some(Command::Unpair) => unpair_t3(),
-        Some(Command::Action { action }) => actions::run(&action, &config.t3_app_name_contains),
+        Some(Command::Action { action, target }) => {
+            run_one_action(&config, target.unwrap_or(config.default_target), &action)
+        }
+        Some(Command::CodexHook) => record_codex_hook(),
         None => run(config),
     }
 }
@@ -173,16 +192,42 @@ fn reset_rgb() -> Result<()> {
     Ok(())
 }
 
-fn print_t3_state(config: &Config) -> Result<()> {
-    let state = T3State::open(config)?;
-    let snapshot = state.slots()?;
+fn print_state(config: &Config, target: TargetId) -> Result<()> {
+    let snapshot = match target {
+        TargetId::T3 => T3State::open(config)?.slots()?,
+        TargetId::Codex => CodexState::open(config)?.slots()?,
+    };
+    println!("Target: {}", target.label());
     println!("State source: {}", snapshot.source.label());
     if let Some(reason) = snapshot.degraded_reason {
-        println!("API fallback reason: {reason}");
+        println!("Fallback reason: {reason}");
     }
     for (index, slot) in snapshot.slots.iter().enumerate() {
         println!("{}. {:?} — {}", index + 1, slot.phase, slot.title);
     }
+    Ok(())
+}
+
+fn run_one_action(config: &Config, target: TargetId, action: &str) -> Result<()> {
+    if let Some(command) = TargetCommand::parse(action) {
+        let resolved = command.resolve(target, &config.target_order)?;
+        println!("{}", resolved);
+        return Ok(());
+    }
+    let slots = if target == TargetId::Codex && action.starts_with("thread.jump.") {
+        CodexState::open(config)?.slots()?.slots
+    } else {
+        Vec::new()
+    };
+    actions::run(target, action, app_name(config, target), &slots)
+}
+
+fn record_codex_hook() -> Result<()> {
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .context("failed to read Codex hook event from stdin")?;
+    codex::record_hook_event(&input)?;
     Ok(())
 }
 
@@ -210,28 +255,44 @@ fn unpair_t3() -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct TargetRuntime {
+    slots: Vec<ThreadSlot>,
+    source: Option<StateSource>,
+    degraded_reason: Option<String>,
+    last_error_at: Option<Instant>,
+}
+
 fn run(config: Config) -> Result<()> {
     let api = HidApi::new().context("failed to initialize HID access")?;
     let mut input = UwUInput::open(&api)?;
     let mut rgb = UwURgb::open(&api)?;
+    let mut active_target = config.default_target;
+    let mut active_layers = HashMap::new();
+    for target in &config.target_order {
+        active_layers.insert(*target, 0);
+    }
     let mut controller = LayerController::new(0);
+    let mut pending_target = None;
+    let mut target_switched_at = Some(Instant::now());
     let mut hall_triggers = [Trigger::default(); 3];
     let mut button_triggers = [Trigger::default(); 3];
-    let mut last_slots = Vec::new();
-    let mut last_state_source = None;
-    let mut last_degraded_reason: Option<String> = None;
-    let mut last_state_error_at: Option<Instant> = None;
+    let mut runtimes = HashMap::<TargetId, TargetRuntime>::new();
     let mut next_render = Instant::now();
     let animation_start = Instant::now();
     let running = Arc::new(AtomicBool::new(true));
     let running_for_signal = Arc::clone(&running);
     ctrlc::set_handler(move || running_for_signal.store(false, Ordering::SeqCst))
         .context("failed to install Ctrl-C handler")?;
-    let state_updates = spawn_t3_state_worker(config.clone(), Arc::clone(&running));
+    let state_updates = spawn_state_workers(config.clone(), Arc::clone(&running));
 
-    eprintln!("t3-uwu connected — layer 1: {}", config.layers[0].name);
+    eprintln!(
+        "uwu-vibe connected — target {} — layer 1: {}",
+        active_target.label(),
+        config.target(active_target).layers[0].name
+    );
     eprintln!("Tap a button to select its layer; hold it to arm three combo actions.");
-    eprintln!("HE keys run the three actions in the active or held layer.");
+    eprintln!("Hold Tools and press the right HE key to cycle targets.");
     eprintln!("The active Wootility profile should leave all six controls unbound.");
     warn_if_wootility_is_running();
 
@@ -243,16 +304,29 @@ fn run(config: Config) -> Result<()> {
             match trigger.transition(value, config.actuation_threshold, config.release_threshold) {
                 Some(TriggerTransition::Pressed) => {
                     if let Some(event) = controller.button_pressed(index, now) {
-                        report_controller_event(event, &config);
+                        report_controller_event(event, &config, active_target);
                         next_render = now;
                     }
                 }
                 Some(TriggerTransition::Released) => {
                     let was_armed = controller.combo_layer().is_some();
                     if let Some(event) = controller.button_released(index) {
-                        report_controller_event(event, &config);
+                        report_controller_event(event, &config, active_target);
                         next_render = now;
                     } else if was_armed {
+                        next_render = now;
+                    }
+                    if !controller.gesture_active()
+                        && let Some(command) = pending_target.take()
+                    {
+                        switch_target(
+                            command,
+                            &config,
+                            &mut active_target,
+                            &mut active_layers,
+                            &mut controller,
+                        )?;
+                        target_switched_at = Some(now);
                         next_render = now;
                     }
                 }
@@ -260,58 +334,104 @@ fn run(config: Config) -> Result<()> {
             }
         }
         if let Some(event) = controller.update(now, Duration::from_millis(config.combo_hold_ms)) {
-            report_controller_event(event, &config);
+            report_controller_event(event, &config, active_target);
             next_render = now;
         }
         for (index, trigger) in hall_triggers.iter_mut().enumerate() {
             let value = sample_value(samples, config.hall_keys[index]);
             if trigger.update(value, config.actuation_threshold, config.release_threshold) {
-                let (name, action) = match controller.key_pressed(index) {
-                    KeyRoute::Base { layer, key } => (
-                        &config.layers[layer].name,
-                        &config.layers[layer].actions[key],
-                    ),
+                let route = controller.key_pressed(index);
+                let (name, action, is_combo) = match route {
+                    KeyRoute::Base { layer, key } => {
+                        let layer = &config.target(active_target).layers[layer];
+                        (layer.name.clone(), layer.actions[key].clone(), false)
+                    }
                     KeyRoute::Combo { layer, key } => {
-                        let layer = &config.layers[layer];
-                        (&layer.hold.name, &layer.hold.actions[key])
+                        let layer = &config.target(active_target).layers[layer];
+                        (
+                            layer.hold.name.clone(),
+                            layer.hold.actions[key].clone(),
+                            true,
+                        )
                     }
                     KeyRoute::Suppressed => {
-                        eprintln!("combo not armed yet; keep holding the layer button");
+                        eprintln!("combo not armed yet, or a target switch is pending");
                         continue;
                     }
                 };
-                eprintln!("{} / key {} -> {}", name, index + 1, action);
-                if let Err(error) = actions::run(action, &config.t3_app_name_contains) {
+                eprintln!(
+                    "{} / {} / key {} -> {}",
+                    active_target,
+                    name,
+                    index + 1,
+                    action
+                );
+                if let Some(command) = TargetCommand::parse(&action) {
+                    if is_combo {
+                        pending_target = Some(command);
+                        controller.suppress_keys_until_release();
+                        eprintln!("target switch queued until the layer button is released");
+                    } else {
+                        switch_target(
+                            command,
+                            &config,
+                            &mut active_target,
+                            &mut active_layers,
+                            &mut controller,
+                        )?;
+                        target_switched_at = Some(now);
+                    }
+                    next_render = now;
+                    continue;
+                }
+                let slots = runtimes
+                    .get(&active_target)
+                    .map_or(&[][..], |runtime| runtime.slots.as_slice());
+                if let Err(error) = actions::run(
+                    active_target,
+                    &action,
+                    app_name(&config, active_target),
+                    slots,
+                ) {
                     eprintln!("action error: {error:#}");
                 }
             }
         }
 
         while let Ok(update) = state_updates.try_recv() {
+            let target = update.target();
+            let runtime = runtimes.entry(target).or_default();
             match update {
-                StateUpdate::Snapshot(snapshot) => {
-                    if last_state_source != Some(snapshot.source) {
-                        eprintln!("T3 state source: {}", snapshot.source.label());
-                        last_state_source = Some(snapshot.source);
+                StateUpdate::Snapshot { snapshot, .. } => {
+                    if runtime.source != Some(snapshot.source) {
+                        eprintln!(
+                            "{} state source: {}",
+                            target.label(),
+                            snapshot.source.label()
+                        );
+                        runtime.source = Some(snapshot.source);
                     }
-                    if snapshot.degraded_reason != last_degraded_reason {
+                    if snapshot.degraded_reason != runtime.degraded_reason {
                         if let Some(reason) = &snapshot.degraded_reason {
-                            eprintln!("T3 API unavailable; using SQLite: {reason}");
-                        } else if last_degraded_reason.is_some() {
-                            eprintln!("T3 API connection restored");
+                            eprintln!("{} state fallback: {reason}", target.label());
+                        } else if runtime.degraded_reason.is_some() {
+                            eprintln!("{} primary state source restored", target.label());
                         }
-                        last_degraded_reason = snapshot.degraded_reason;
+                        runtime.degraded_reason = snapshot.degraded_reason;
                     }
-                    last_slots = snapshot.slots;
-                    last_state_error_at = None;
+                    runtime.slots = snapshot.slots;
+                    runtime.last_error_at = None;
+                    if target == active_target {
+                        next_render = now;
+                    }
                 }
-                StateUpdate::Error(error) => {
-                    let should_report = last_state_error_at.is_none_or(|reported| {
+                StateUpdate::Error { error, .. } => {
+                    let should_report = runtime.last_error_at.is_none_or(|reported| {
                         now.duration_since(reported) >= Duration::from_secs(10)
                     });
                     if should_report {
-                        eprintln!("T3 state error: {error}");
-                        last_state_error_at = Some(now);
+                        eprintln!("{} state error: {error}", target.label());
+                        runtime.last_error_at = Some(now);
                     }
                 }
             }
@@ -320,12 +440,18 @@ fn run(config: Config) -> Result<()> {
             if !running.load(Ordering::SeqCst) {
                 continue;
             }
+            let slots = runtimes
+                .get(&active_target)
+                .map_or(&[][..], |runtime| runtime.slots.as_slice());
+            let switch_elapsed = target_switched_at.map(|switched| now.duration_since(switched));
             let frame = render_frame(
                 &config,
+                active_target,
                 controller.active_layer(),
                 controller.combo_layer(),
-                &last_slots,
+                slots,
                 animation_start.elapsed(),
+                switch_elapsed,
             );
             if let Err(error) = rgb.set_frame(&frame)
                 && running.load(Ordering::SeqCst)
@@ -339,45 +465,169 @@ fn run(config: Config) -> Result<()> {
     rgb.reset()
 }
 
-fn report_controller_event(event: ControllerEvent, config: &Config) {
+fn switch_target(
+    command: TargetCommand,
+    config: &Config,
+    active_target: &mut TargetId,
+    active_layers: &mut HashMap<TargetId, usize>,
+    controller: &mut LayerController,
+) -> Result<()> {
+    let next = command.resolve(*active_target, &config.target_order)?;
+    if next == *active_target {
+        return Ok(());
+    }
+    active_layers.insert(*active_target, controller.active_layer());
+    let next_layer = active_layers.get(&next).copied().unwrap_or(0);
+    *controller = LayerController::new(next_layer);
+    *active_target = next;
+    eprintln!(
+        "target {} — layer {}: {}",
+        next.label(),
+        next_layer + 1,
+        config.target(next).layers[next_layer].name
+    );
+    Ok(())
+}
+
+fn report_controller_event(event: ControllerEvent, config: &Config, target: TargetId) {
     match event {
         ControllerEvent::LayerSelected(layer) => {
-            eprintln!("layer {}: {}", layer + 1, config.layers[layer].name);
+            eprintln!(
+                "{} layer {}: {}",
+                target,
+                layer + 1,
+                config.target(target).layers[layer].name
+            );
         }
         ControllerEvent::ComboArmed(layer) => {
-            let config = &config.layers[layer];
-            eprintln!("hold layer {} armed: {}", layer + 1, config.hold.name);
+            let layer_config = &config.target(target).layers[layer];
+            eprintln!(
+                "{} hold layer {} armed: {}",
+                target,
+                layer + 1,
+                layer_config.hold.name
+            );
         }
     }
 }
 
 enum StateUpdate {
-    Snapshot(StateSnapshot),
-    Error(String),
+    Snapshot {
+        target: TargetId,
+        snapshot: StateSnapshot,
+    },
+    Error {
+        target: TargetId,
+        error: String,
+    },
 }
 
-fn spawn_t3_state_worker(config: Config, running: Arc<AtomicBool>) -> Receiver<StateUpdate> {
+impl StateUpdate {
+    const fn target(&self) -> TargetId {
+        match self {
+            Self::Snapshot { target, .. } | Self::Error { target, .. } => *target,
+        }
+    }
+}
+
+fn spawn_state_workers(config: Config, running: Arc<AtomicBool>) -> Receiver<StateUpdate> {
     let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let state = match T3State::open(&config) {
-            Ok(state) => state,
-            Err(error) => {
-                let _ = sender.send(StateUpdate::Error(format!("{error:#}")));
-                return;
+    for target in config.target_order.iter().copied() {
+        match target {
+            TargetId::T3 => {
+                spawn_t3_state_worker(config.clone(), Arc::clone(&running), sender.clone())
             }
-        };
+            TargetId::Codex => {
+                spawn_codex_state_worker(config.clone(), Arc::clone(&running), sender.clone())
+            }
+        }
+    }
+    receiver
+}
+
+fn spawn_t3_state_worker(config: Config, running: Arc<AtomicBool>, sender: Sender<StateUpdate>) {
+    thread::spawn(move || {
+        let mut state = None;
         while running.load(Ordering::SeqCst) {
-            let update = match state.slots() {
-                Ok(snapshot) => StateUpdate::Snapshot(snapshot),
-                Err(error) => StateUpdate::Error(format!("{error:#}")),
-            };
-            if sender.send(update).is_err() {
-                return;
+            if state.is_none() {
+                match T3State::open(&config) {
+                    Ok(opened) => state = Some(opened),
+                    Err(error) => {
+                        if send_state_error(&sender, TargetId::T3, &error).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            if let Some(opened) = &state {
+                let update = match opened.slots() {
+                    Ok(snapshot) => StateUpdate::Snapshot {
+                        target: TargetId::T3,
+                        snapshot,
+                    },
+                    Err(error) => StateUpdate::Error {
+                        target: TargetId::T3,
+                        error: format!("{error:#}"),
+                    },
+                };
+                if sender.send(update).is_err() {
+                    return;
+                }
             }
             thread::sleep(Duration::from_millis(config.poll_interval_ms));
         }
     });
-    receiver
+}
+
+fn spawn_codex_state_worker(config: Config, running: Arc<AtomicBool>, sender: Sender<StateUpdate>) {
+    thread::spawn(move || {
+        let mut state = None;
+        while running.load(Ordering::SeqCst) {
+            if state.is_none() {
+                match CodexState::open(&config) {
+                    Ok(opened) => state = Some(opened),
+                    Err(error) => {
+                        if send_state_error(&sender, TargetId::Codex, &error).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            if let Some(opened) = state.as_mut() {
+                match opened.slots() {
+                    Ok(snapshot) => {
+                        if sender
+                            .send(StateUpdate::Snapshot {
+                                target: TargetId::Codex,
+                                snapshot,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        if send_state_error(&sender, TargetId::Codex, &error).is_err() {
+                            return;
+                        }
+                        state = None;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(config.poll_interval_ms));
+        }
+    });
+}
+
+fn send_state_error(
+    sender: &Sender<StateUpdate>,
+    target: TargetId,
+    error: &anyhow::Error,
+) -> std::result::Result<(), mpsc::SendError<StateUpdate>> {
+    sender.send(StateUpdate::Error {
+        target,
+        error: format!("{error:#}"),
+    })
 }
 
 fn warn_if_wootility_is_running() {
@@ -389,8 +639,15 @@ fn warn_if_wootility_is_running() {
         .is_ok_and(|status| status.success());
     if running {
         eprintln!(
-            "warning: Wootility is running and may override t3-uwu lighting; save the device profile, then quit Wootility"
+            "warning: Wootility is running and may override uwu-vibe lighting; save the device profile, then quit Wootility"
         );
+    }
+}
+
+fn app_name(config: &Config, target: TargetId) -> &str {
+    match target {
+        TargetId::T3 => &config.t3_app_name_contains,
+        TargetId::Codex => &config.codex_app_name_contains,
     }
 }
 
@@ -400,13 +657,25 @@ fn sample_value(samples: &HashMap<Position, hardware::KeySample>, position: Posi
 
 fn render_frame(
     config: &Config,
+    target: TargetId,
     active_layer: usize,
     combo_layer: Option<usize>,
     slots: &[ThreadSlot],
     elapsed: Duration,
+    switch_elapsed: Option<Duration>,
 ) -> HashMap<Position, Rgb> {
+    let target_config = config.target(target);
+    if switch_elapsed.is_some_and(|elapsed| elapsed < Duration::from_millis(650)) {
+        let accent = Rgb::from_hex(&target_config.accent).unwrap_or(Rgb(120, 100, 255));
+        let intensity = 0.55 + 0.25 * ((elapsed.as_secs_f32() * 10.0).sin() + 1.0) / 2.0;
+        return LED_POSITIONS
+            .into_iter()
+            .map(|position| (position, accent.scale(config.brightness * intensity)))
+            .collect();
+    }
+
     let visual_layer = combo_layer.unwrap_or(active_layer);
-    let layer = &config.layers[visual_layer];
+    let layer = &target_config.layers[visual_layer];
     let color = if combo_layer.is_some() {
         &layer.hold.color
     } else {
@@ -419,16 +688,26 @@ fn render_frame(
         .map(|position| (position, layer_color.scale(config.brightness * pulse)))
         .collect::<HashMap<_, _>>();
 
+    let accent = Rgb::from_hex(&target_config.accent).unwrap_or_default();
+    for position in [
+        Position::new(0, 0),
+        Position::new(0, 2),
+        Position::new(0, 4),
+        Position::new(0, 6),
+    ] {
+        frame.insert(position, accent.scale(config.brightness * 0.42));
+    }
+
     for (index, position) in config.layer_buttons.iter().copied().enumerate() {
         let color =
             if combo_layer == Some(index) || (combo_layer.is_none() && index == active_layer) {
                 Rgb(255, 255, 255)
             } else if combo_layer.is_some() && index == active_layer {
-                Rgb::from_hex(&config.layers[index].color)
+                Rgb::from_hex(&target_config.layers[index].color)
                     .unwrap_or_default()
                     .scale(0.45)
             } else {
-                Rgb::from_hex(&config.layers[index].color)
+                Rgb::from_hex(&target_config.layers[index].color)
                     .unwrap_or_default()
                     .scale(0.15)
             };
@@ -437,25 +716,16 @@ fn render_frame(
 
     for (index, position) in config.hall_keys.iter().copied().enumerate() {
         let color = if combo_layer.is_none() && active_layer == 0 {
-            slots
-                .get(index)
-                .map_or(Rgb(25, 25, 30), |slot| phase_color(slot.phase))
+            slots.get(index).map_or_else(
+                || Rgb::from_hex(&target_config.status.unknown).unwrap_or_default(),
+                |slot| {
+                    Rgb::from_hex(target_config.status.color_for(slot.phase)).unwrap_or_default()
+                },
+            )
         } else {
             layer_color
         };
         frame.insert(position, color.scale(config.brightness));
     }
     frame
-}
-
-fn phase_color(phase: AgentPhase) -> Rgb {
-    match phase {
-        AgentPhase::Idle => Rgb(25, 25, 30),
-        AgentPhase::Starting => Rgb(80, 120, 255),
-        AgentPhase::Running => Rgb(40, 120, 255),
-        AgentPhase::WaitingApproval => Rgb(255, 90, 50),
-        AgentPhase::WaitingInput => Rgb(255, 190, 45),
-        AgentPhase::Completed => Rgb(55, 220, 120),
-        AgentPhase::Failed => Rgb(255, 35, 65),
-    }
 }

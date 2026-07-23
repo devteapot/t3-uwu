@@ -1,0 +1,120 @@
+# The daemon starts in this target. target_order controls target.next/previous.
+default_target = "t3"
+target_order = ["t3", "codex"]
+
+# "auto" prefers T3's API after pairing and falls back to SQLite.
+t3_state_source = "auto"
+t3_runtime = "/Users/YOU/.t3/userdata/server-runtime.json"
+t3_database = "/Users/YOU/.t3/userdata/state.sqlite"
+# t3_http_url = "https://t3.example.com"
+t3_bearer_token_env = "UWU_VIBE_T3_BEARER_TOKEN"
+t3_app_name_contains = "T3 Code"
+
+# Codex state is read through `codex app-server`.
+codex_bin = "codex"
+codex_app_name_contains = "ChatGPT"
+codex_source_kinds = ["cli", "vscode", "appServer"]
+
+actuation_threshold = 0.42
+release_threshold = 0.18
+brightness = 0.65
+poll_interval_ms = 750
+combo_hold_ms = 350
+
+hall_keys = [
+  { row = 2, col = 1 },
+  { row = 2, col = 3 },
+  { row = 2, col = 5 },
+]
+
+layer_buttons = [
+  { row = 3, col = 2 },
+  { row = 3, col = 3 },
+  { row = 3, col = 4 },
+]
+
+[targets.t3]
+accent = "#7c6cff"
+
+[targets.t3.status]
+idle = "#19191e"
+starting = "#5078ff"
+running = "#2878ff"
+waiting_approval = "#ff5a32"
+waiting_input = "#ffbe2d"
+completed = "#37dc78"
+failed = "#ff2341"
+unknown = "#19191e"
+
+[[targets.t3.layers]]
+name = "Agents"
+color = "#7c6cff"
+actions = ["thread.jump.1", "thread.jump.2", "thread.jump.3"]
+
+[targets.t3.layers.hold]
+name = "More agents"
+color = "#d06cff"
+actions = ["thread.jump.4", "thread.jump.5", "thread.jump.6"]
+
+[[targets.t3.layers]]
+name = "Chat"
+color = "#24c8db"
+actions = ["chat.new", "commandPalette.toggle", "diff.toggle"]
+
+[targets.t3.layers.hold]
+name = "Navigate"
+color = "#24db8f"
+actions = ["thread.previous", "thread.next", "chat.newLocal"]
+
+[[targets.t3.layers]]
+name = "Tools"
+color = "#ff9f43"
+actions = ["terminal.toggle", "preview.toggle", "modelPicker.toggle"]
+
+[targets.t3.layers.hold]
+name = "Workspace"
+color = "#ff5f57"
+actions = ["sidebar.toggle", "rightPanel.toggle", "target.next"]
+
+[targets.codex]
+accent = "#10a37f"
+
+[targets.codex.status]
+idle = "#d8d8d8"
+starting = "#4388ff"
+running = "#4388ff"
+waiting_approval = "#ffad32"
+waiting_input = "#ffd04a"
+completed = "#42d77d"
+failed = "#ff3b4f"
+unknown = "#19191e"
+
+[[targets.codex.layers]]
+name = "Agents"
+color = "#10a37f"
+actions = ["thread.jump.1", "thread.jump.2", "thread.jump.3"]
+
+[targets.codex.layers.hold]
+name = "More agents"
+color = "#48c6a9"
+actions = ["thread.jump.4", "thread.jump.5", "thread.jump.6"]
+
+[[targets.codex.layers]]
+name = "Chat"
+color = "#4388ff"
+actions = ["chat.new", "commandPalette.toggle", "diff.toggle"]
+
+[targets.codex.layers.hold]
+name = "Navigate"
+color = "#35b8ed"
+actions = ["thread.previous", "thread.next", "chat.newLocal"]
+
+[[targets.codex.layers]]
+name = "Tools"
+color = "#ffad32"
+actions = ["terminal.toggle", "preview.toggle", "modelPicker.toggle"]
+
+[targets.codex.layers.hold]
+name = "Workspace"
+color = "#ff6b6b"
+actions = ["sidebar.toggle", "rightPanel.toggle", "target.next"]

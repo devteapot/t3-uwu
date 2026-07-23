@@ -6,52 +6,19 @@ use reqwest::{StatusCode, Url, blocking::Client};
 use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 
-use crate::config::{Config, T3StateSource};
+use crate::{
+    config::{Config, T3StateSource},
+    target::{AgentPhase, StateSnapshot, StateSource, ThreadSlot},
+};
 
-const KEYRING_SERVICE: &str = "devteapot.t3-uwu";
+const KEYRING_SERVICE: &str = "devteapot.uwu-vibe";
+const LEGACY_KEYRING_SERVICE: &str = "devteapot.t3-uwu";
 const KEYRING_ACCOUNT: &str = "t3-api";
+const DEFAULT_TOKEN_ENV: &str = "UWU_VIBE_T3_BEARER_TOKEN";
+const LEGACY_TOKEN_ENV: &str = "T3_UWU_BEARER_TOKEN";
 const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const BOOTSTRAP_TOKEN_TYPE: &str = "urn:t3:params:oauth:token-type:environment-bootstrap";
 const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AgentPhase {
-    Idle,
-    Starting,
-    Running,
-    WaitingApproval,
-    WaitingInput,
-    Completed,
-    Failed,
-}
-
-#[derive(Clone, Debug)]
-pub struct ThreadSlot {
-    pub title: String,
-    pub phase: AgentPhase,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ActiveStateSource {
-    Api,
-    Sqlite,
-}
-
-impl ActiveStateSource {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Api => "T3 API",
-            Self::Sqlite => "SQLite",
-        }
-    }
-}
-
-pub struct StateSnapshot {
-    pub slots: Vec<ThreadSlot>,
-    pub source: ActiveStateSource,
-    /// Set when the preferred API failed and this snapshot came from SQLite.
-    pub degraded_reason: Option<String>,
-}
 
 pub struct T3State {
     api: Option<ApiState>,
@@ -63,7 +30,7 @@ impl T3State {
         match config.t3_state_source {
             T3StateSource::Api => Ok(Self {
                 api: Some(ApiState::from_config(config)?.context(
-                    "T3 API is not paired; run `t3-uwu pair` or set the configured bearer-token environment variable",
+                    "T3 API is not paired; run `uwu-vibe pair` or set the configured bearer-token environment variable",
                 )?),
                 sqlite: None,
             }),
@@ -98,7 +65,7 @@ impl T3State {
                 Ok(slots) => {
                     return Ok(StateSnapshot {
                         slots,
-                        source: ActiveStateSource::Api,
+                        source: StateSource::T3Api,
                         degraded_reason: None,
                     });
                 }
@@ -106,7 +73,7 @@ impl T3State {
                     if let Some(sqlite) = &self.sqlite {
                         return Ok(StateSnapshot {
                             slots: sqlite.slots()?,
-                            source: ActiveStateSource::Sqlite,
+                            source: StateSource::T3Sqlite,
                             degraded_reason: Some(format!("{api_error:#}")),
                         });
                     }
@@ -121,7 +88,7 @@ impl T3State {
             .context("no T3 state backend is available")?;
         Ok(StateSnapshot {
             slots: sqlite.slots()?,
-            source: ActiveStateSource::Sqlite,
+            source: StateSource::T3Sqlite,
             degraded_reason: None,
         })
     }
@@ -144,7 +111,8 @@ impl SqliteState {
 
     fn slots(&self) -> Result<Vec<ThreadSlot>> {
         let mut statement = self.connection.prepare_cached(
-            "SELECT t.title,
+            "SELECT t.thread_id,
+                    t.title,
                     t.pending_approval_count,
                     t.pending_user_input_count,
                     COALESCE(s.status, ''),
@@ -178,13 +146,14 @@ impl SqliteState {
              LIMIT 3",
         )?;
         let rows = statement.query_map([], |row| {
-            let approval: i64 = row.get(1)?;
-            let input: i64 = row.get(2)?;
-            let session: String = row.get(3)?;
-            let turn: String = row.get(4)?;
-            let completed_at: Option<String> = row.get(5)?;
+            let approval: i64 = row.get(2)?;
+            let input: i64 = row.get(3)?;
+            let session: String = row.get(4)?;
+            let turn: String = row.get(5)?;
+            let completed_at: Option<String> = row.get(6)?;
             Ok(ThreadSlot {
-                title: row.get(0)?,
+                id: Some(row.get(0)?),
+                title: row.get(1)?,
                 phase: resolve_phase(
                     approval > 0,
                     input > 0,
@@ -234,7 +203,7 @@ impl ApiState {
             .context("failed to reach the T3 API")?;
         let status = response.status();
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            bail!("T3 API authorization expired or was revoked; run `t3-uwu pair` again");
+            bail!("T3 API authorization expired or was revoked; run `uwu-vibe pair` again");
         }
         let response = response
             .error_for_status()
@@ -305,7 +274,7 @@ pub fn pair(pairing_url: &str) -> Result<String> {
             ("subject_token_type", BOOTSTRAP_TOKEN_TYPE),
             ("requested_token_type", ACCESS_TOKEN_TYPE),
             ("scope", "orchestration:read"),
-            ("client_label", "t3-uwu"),
+            ("client_label", "uwu-vibe"),
             ("client_device_type", "desktop"),
             ("client_os", "macOS"),
         ])
@@ -323,18 +292,26 @@ pub fn pair(pairing_url: &str) -> Result<String> {
     if !token.token_type.eq_ignore_ascii_case("bearer") {
         bail!("T3 returned unsupported token type {:?}", token.token_type);
     }
-    keyring_entry()?
+    keyring_entry(KEYRING_SERVICE)?
         .set_password(&token.access_token)
         .context("failed to save the T3 credential in the system keychain")?;
     Ok(origin)
 }
 
 pub fn unpair() -> Result<bool> {
-    match keyring_entry()?.delete_credential() {
-        Ok(()) => Ok(true),
-        Err(KeyringError::NoEntry) => Ok(false),
-        Err(error) => Err(error).context("failed to remove the T3 credential from Keychain"),
+    let mut removed = false;
+    for service in [KEYRING_SERVICE, LEGACY_KEYRING_SERVICE] {
+        match keyring_entry(service)?.delete_credential() {
+            Ok(()) => removed = true,
+            Err(KeyringError::NoEntry) => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to remove the T3 credential from Keychain service {service}")
+                });
+            }
+        }
     }
+    Ok(removed)
 }
 
 fn resolve_origin(config: &Config) -> Result<Option<String>> {
@@ -369,26 +346,41 @@ fn resolve_origin(config: &Config) -> Result<Option<String>> {
 
 fn resolve_token(config: &Config) -> Result<Option<String>> {
     if !config.t3_bearer_token_env.is_empty() {
-        match env::var(&config.t3_bearer_token_env) {
-            Ok(token) if !token.trim().is_empty() => return Ok(Some(token)),
-            Ok(_) | Err(env::VarError::NotPresent) => {}
+        if let Some(token) = token_from_env(&config.t3_bearer_token_env)? {
+            return Ok(Some(token));
+        }
+        if config.t3_bearer_token_env == DEFAULT_TOKEN_ENV
+            && let Some(token) = token_from_env(LEGACY_TOKEN_ENV)?
+        {
+            return Ok(Some(token));
+        }
+    }
+    for service in [KEYRING_SERVICE, LEGACY_KEYRING_SERVICE] {
+        match keyring_entry(service)?.get_password() {
+            Ok(token) => return Ok(Some(token)),
+            Err(KeyringError::NoEntry) => {}
             Err(error) => {
-                return Err(error)
-                    .context("configured T3 bearer-token environment variable is invalid");
+                return Err(error).with_context(|| {
+                    format!("failed to read the T3 credential from Keychain service {service}")
+                });
             }
         }
     }
-    match keyring_entry()?.get_password() {
-        Ok(token) => Ok(Some(token)),
-        Err(KeyringError::NoEntry) => Ok(None),
+    Ok(None)
+}
+
+fn token_from_env(name: &str) -> Result<Option<String>> {
+    match env::var(name) {
+        Ok(token) if !token.trim().is_empty() => Ok(Some(token)),
+        Ok(_) | Err(env::VarError::NotPresent) => Ok(None),
         Err(error) => {
-            Err(error).context("failed to read the T3 credential from the system keychain")
+            Err(error).context("configured T3 bearer-token environment variable is invalid")
         }
     }
 }
 
-fn keyring_entry() -> Result<Entry> {
-    Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).context("failed to open the system keychain")
+fn keyring_entry(service: &str) -> Result<Entry> {
+    Entry::new(service, KEYRING_ACCOUNT).context("failed to open the system keychain")
 }
 
 fn parse_pairing_url(input: &str) -> Result<(String, String)> {
@@ -488,6 +480,7 @@ fn slots_from_api(threads: Vec<ApiThread>) -> Vec<ThreadSlot> {
                 .as_ref()
                 .is_some_and(|turn| turn.completed_at.is_some());
             ThreadSlot {
+                id: Some(thread.id),
                 title: thread.title,
                 phase: resolve_phase(
                     thread.has_pending_approvals,

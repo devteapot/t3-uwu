@@ -1,4 +1,4 @@
-t3-uwu contains an independent Rust implementation of the documented Wooting
+uwu-vibe contains an independent Rust implementation of the documented Wooting
 analog and RGB HID protocols. Protocol details were derived from Wooting's
 official open-source SDKs, which are licensed under MPL-2.0:
 

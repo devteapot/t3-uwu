@@ -23,6 +23,7 @@ struct HoldGesture {
 pub struct LayerController {
     active_layer: usize,
     hold: Option<HoldGesture>,
+    suppress_until_release: bool,
 }
 
 impl LayerController {
@@ -30,6 +31,7 @@ impl LayerController {
         Self {
             active_layer,
             hold: None,
+            suppress_until_release: false,
         }
     }
 
@@ -41,6 +43,14 @@ impl LayerController {
         self.hold
             .filter(|gesture| gesture.armed)
             .map(|gesture| gesture.layer)
+    }
+
+    pub const fn gesture_active(&self) -> bool {
+        self.hold.is_some()
+    }
+
+    pub fn suppress_keys_until_release(&mut self) {
+        self.suppress_until_release = true;
     }
 
     pub fn button_pressed(&mut self, layer: usize, now: Instant) -> Option<ControllerEvent> {
@@ -70,6 +80,7 @@ impl LayerController {
             return None;
         }
         self.hold = None;
+        self.suppress_until_release = false;
         if gesture.armed {
             return None;
         }
@@ -78,6 +89,9 @@ impl LayerController {
     }
 
     pub fn key_pressed(&mut self, key: usize) -> KeyRoute {
+        if self.suppress_until_release {
+            return KeyRoute::Suppressed;
+        }
         let Some(gesture) = self.hold.as_mut() else {
             return KeyRoute::Base {
                 layer: self.active_layer,
@@ -141,5 +155,20 @@ mod tests {
         );
         assert_eq!(controller.button_released(0), None);
         assert_eq!(controller.active_layer(), 1);
+    }
+
+    #[test]
+    fn a_modal_action_suppresses_keys_until_the_layer_button_is_released() {
+        let now = Instant::now();
+        let mut controller = LayerController::new(0);
+        controller.button_pressed(1, now);
+        controller.update(now + HOLD, HOLD);
+        controller.suppress_keys_until_release();
+        assert_eq!(controller.key_pressed(0), KeyRoute::Suppressed);
+        assert_eq!(controller.button_released(1), None);
+        assert_eq!(
+            controller.key_pressed(0),
+            KeyRoute::Base { layer: 0, key: 0 }
+        );
     }
 }
