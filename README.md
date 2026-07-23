@@ -32,7 +32,7 @@ Hold layers:
 |---|---|---|---|
 | 1 — More agents | Thread 4 | Thread 5 | Thread 6 |
 | 2 — Navigate | Previous thread | Next thread | New local chat |
-| 3 — Workspace | Sidebar | Right panel | Refresh preview |
+| 3 — Workspace | Sidebar | Right panel | Focus T3 Code |
 
 On the Agents layer, the main key LEDs reflect the first three threads in T3's
 current sidebar-v2 ordering: active threads in newest-created order, followed

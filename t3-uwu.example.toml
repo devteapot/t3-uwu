@@ -55,4 +55,4 @@ actions = ["terminal.toggle", "preview.toggle", "modelPicker.toggle"]
 [layers.hold]
 name = "Workspace"
 color = "#ff5f57"
-actions = ["sidebar.toggle", "rightPanel.toggle", "preview.refresh"]
+actions = ["sidebar.toggle", "rightPanel.toggle", "app.activate"]

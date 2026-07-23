@@ -128,7 +128,7 @@ impl Default for Config {
                         actions: [
                             "sidebar.toggle".into(),
                             "rightPanel.toggle".into(),
-                            "preview.refresh".into(),
+                            "app.activate".into(),
                         ],
                     },
                 },
