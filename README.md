@@ -98,6 +98,9 @@ cargo run -- action chat.new --target codex
 cargo run
 ```
 
+On a normal `cargo run`, the daemon prints the configured keymap for every
+enabled target before it starts handling input.
+
 The first shortcut action may prompt for macOS Accessibility permission. Enable
 the terminal (or packaged app) that launched `uwu-vibe` under **System Settings →
 Privacy & Security → Accessibility**, then restart that application. Codex

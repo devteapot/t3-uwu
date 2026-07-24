@@ -25,7 +25,7 @@ use clap::{Parser, Subcommand};
 use hidapi::HidApi;
 
 use codex::CodexState;
-use config::{Config, DepthActionConfig};
+use config::{Config, DepthActionConfig, KeyGestureConfig};
 use controls::{ControllerEvent, KeyGestureController, KeyGestureEvent, KeyRoute, LayerController};
 use hardware::{Position, Trigger, TriggerTransition, UwUInput};
 use rgb::{EDGE_POSITIONS, LED_POSITIONS, Rgb, UwURgb};
@@ -308,6 +308,7 @@ fn run(config: Config) -> Result<()> {
         active_target.label(),
         config.target(active_target).layers[0].name
     );
+    eprintln!("{}", configured_keymap(&config));
     eprintln!("Tap a button to select its layer; hold it to arm three combo actions.");
     eprintln!("Double-tap the middle button to cycle targets.");
     eprintln!("Hold Tools and press the right HE key to cycle targets.");
@@ -554,6 +555,76 @@ fn run(config: Config) -> Result<()> {
     }
     eprintln!("restoring onboard UwU lighting");
     rgb.reset()
+}
+
+fn configured_keymap(config: &Config) -> String {
+    let mut lines = vec!["Configured keymap (HE 1 | HE 2 | HE 3):".to_owned()];
+    for target in &config.target_order {
+        let startup = if *target == config.default_target {
+            " (startup)"
+        } else {
+            ""
+        };
+        lines.push(format!("  {}{startup}", target.label()));
+        for (index, layer) in config.target(*target).layers.iter().enumerate() {
+            let double_tap = configured_action(layer.double_tap_action.as_deref())
+                .map_or_else(String::new, |action| {
+                    format!(" [button double-tap -> {action}]")
+                });
+            lines.push(format!(
+                "    Button {} — {}{double_tap}: {}",
+                index + 1,
+                layer.name,
+                configured_key_actions(&layer.actions, &layer.key_gestures)
+            ));
+            lines.push(format!(
+                "      hold — {}: {}",
+                layer.hold.name,
+                configured_key_actions(&layer.hold.actions, &layer.hold.key_gestures)
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+fn configured_key_actions(actions: &[String; 3], gestures: &[KeyGestureConfig; 3]) -> String {
+    actions
+        .iter()
+        .zip(gestures)
+        .map(|(action, gesture)| configured_key_action(action, gesture))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn configured_key_action(action: &str, gesture: &KeyGestureConfig) -> String {
+    if gesture.depth_enabled() {
+        let mut mappings = Vec::new();
+        if let Some(fallback) = configured_action(gesture.depth_fallback_action.as_deref()) {
+            mappings.push(format!("fallback -> {fallback}"));
+        }
+        mappings.extend(
+            gesture
+                .depth_actions
+                .iter()
+                .map(|depth| format!("{:.0}% -> {}", depth.at * 100.0, depth.action)),
+        );
+        return format!("depth({})", mappings.join(", "));
+    }
+
+    let hold = configured_action(gesture.hold_action.as_deref());
+    let double_tap = configured_action(gesture.double_tap_action.as_deref());
+    if hold.is_none() && double_tap.is_none() {
+        return action.to_owned();
+    }
+
+    let mut mappings = vec![format!("tap -> {action}")];
+    if let Some(hold) = hold {
+        mappings.push(format!("hold -> {hold}"));
+    }
+    if let Some(double_tap) = double_tap {
+        mappings.push(format!("double-tap -> {double_tap}"));
+    }
+    mappings.join(", ")
 }
 
 fn switch_target(
@@ -1033,6 +1104,30 @@ mod tests {
         assert_eq!(
             depth_action_for(0.4, &actions, Some("fallback")),
             Some("fallback")
+        );
+    }
+
+    #[test]
+    fn startup_keymap_lists_targets_layers_and_gestures() {
+        let mut config = Config::default();
+        config.targets.t3.layers[0].key_gestures[0].hold_action = Some("chat.new".into());
+        config.targets.t3.layers[0].key_gestures[1].depth_actions =
+            vec![depth(0.33, "light"), depth(0.95, "deep")];
+
+        let keymap = configured_keymap(&config);
+
+        assert!(keymap.contains("T3 Code (startup)"));
+        assert!(keymap.contains("Codex"));
+        assert!(keymap.contains(
+            "Button 1 — Agents: tap -> thread.jump.1, hold -> chat.new | \
+             depth(33% -> light, 95% -> deep) | thread.jump.3"
+        ));
+        assert!(keymap.contains(
+            "Button 2 — Chat [button double-tap -> target.next]: \
+             chat.new | commandPalette.toggle | diff.toggle"
+        ));
+        assert!(
+            keymap.contains("hold — Workspace: sidebar.toggle | rightPanel.toggle | target.next")
         );
     }
 }
